@@ -1,0 +1,18 @@
+{
+  "name": "music-metadata-editor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local-first music metadata editor",
+  "main": "src/main/index.js",
+  "scripts": {
+    "start": "node scripts/start.js",
+    "test": "node --test tests/unit/*.test.js tests/integration/*.test.js tests/renderer/*.test.js",
+    "test:python": "node scripts/test-python.js"
+  },
+  "devDependencies": {
+    "electron": "44.7.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

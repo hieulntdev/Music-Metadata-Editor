@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en" data-theme="light">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://coverartarchive.org; style-src 'self'; script-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Music Metadata Editor</title>
+  <link rel="stylesheet" href="styles/tokens.css">
+  <link rel="stylesheet" href="styles/layout.css">
+  <link rel="stylesheet" href="styles/components.css">
+</head>
+<body>
+  <main class="app-shell" id="appShell">
+    <header class="app-header">
+      <div class="toolbar" aria-label="Primary actions">
+        <button class="button ghost" id="importFilesButton"><svg viewBox="0 0 24 24"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 8H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-9a2 2 0 0 0-2-2h-1"/></svg>Import Files</button>
+        <button class="button ghost" id="importFolderButton"><svg viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v11H3z"/></svg>Import Folder</button>
+        <button class="button ghost" id="batchButton" disabled><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10M17 16v6m-3-3h6"/></svg>Batch Edit</button>
+        <button class="button ghost" id="matchButton" disabled><svg viewBox="0 0 24 24"><path d="m12 3 1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5zM19 15l.8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></svg><span id="matchButtonLabel">Auto Match (0)</span></button>
+        <button class="button ghost" id="artworkButton" disabled><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="9" r="2"/><path d="m4 17 5-5 4 4 2-2 5 4"/></svg>Artwork</button>
+        <button class="button ghost" id="clearButton"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16M9 7V4h6v3m3 0-1 14H7L6 7m4 4v6m4-6v6"/></svg>Clear</button>
+        <button class="button primary" id="saveButton" disabled><svg viewBox="0 0 24 24"><path d="M5 3h12l2 2v16H5zM8 3v6h8V3M8 21v-8h8v8"/></svg>Preview &amp; Save</button>
+      </div>
+      <div class="header-tools">
+        <label class="search-shell" aria-label="Search library"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="globalSearch" type="search" placeholder="Search tracks, artists, albums…"></label>
+        <button class="icon-button" id="themeButton" aria-label="Switch to dark mode" title="Switch to dark mode"><svg class="theme-icon moon-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 15.2A8.5 8.5 0 0 1 8.8 4a8.5 8.5 0 1 0 11.2 11.2Z"/></svg><svg class="theme-icon sun-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M4.9 4.9l1.4 1.4m11.4 11.4 1.4 1.4M2 12h2m16 0h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg></button>
+        <button class="icon-button" id="settingsButton" aria-label="Open settings" title="Settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6v.2h-4V21a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H2.8v-4H3a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.6v-.2h4V3a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.2v4H21a1.7 1.7 0 0 0-1.6 1Z"/></svg></button>
+      </div>
+    </header>
+
+    <section class="output-folder-bar" aria-labelledby="outputFolderLabel">
+      <span class="output-folder-label" id="outputFolderLabel">Output Folder</span>
+      <button class="folder-picker" id="outputFolderButton" type="button" aria-describedby="outputFolderError">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h7l2 2h9v11H3z"/></svg>
+        <span class="folder-path muted" id="outputFolderPath">Choose where edited copies will be saved…</span>
+        <span class="folder-browse">Browse…</span>
+      </button>
+      <span class="output-folder-error" id="outputFolderError" hidden>Choose an Output Folder before saving.</span>
+    </section>
+
+    <section class="filter-strip" aria-label="Library filters">
+      <label class="compact-search"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="m20 20-4-4"/></svg><input id="listFilter" type="search" placeholder="Filter in current list…"></label>
+      <div class="filter-chips" id="filterChips" role="group" aria-label="Status filter">
+        <button class="chip selected" data-filter="all">All <span id="allCount">(0)</span></button>
+        <button class="chip" data-filter="dirty"><span class="status-dot dirty"></span>Dirty <span id="dirtyCount">(0)</span></button>
+        <button class="chip" data-filter="conflict"><span class="status-dot conflict"></span>Conflicts <span id="conflictCount">(0)</span></button>
+        <button class="chip" data-filter="error"><span class="status-dot error"></span>Errors <span id="errorCount">(0)</span></button>
+      </div>
+    </section>
+
+    <section class="workspace" id="workspace">
+      <section class="library-panel" aria-label="Music library">
+        <div class="virtual-table" id="tableViewport" role="table" aria-label="Imported music files" tabindex="0">
+          <div class="table-header" role="row">
+            <div class="cell select-cell" role="columnheader"><input id="selectAll" type="checkbox" aria-label="Select all visible tracks"></div>
+            <button class="cell title-cell sort-header resizable-header" data-sort="title" role="columnheader" aria-sort="none">Title<span class="sort-indicator" aria-hidden="true"></span><span class="column-resizer" data-column="title" aria-hidden="true"></span></button>
+            <button class="cell artist-cell sort-header resizable-header" data-sort="artist" role="columnheader" aria-sort="ascending">Artist<span class="sort-indicator" aria-hidden="true">↑</span><span class="column-resizer" data-column="artist" aria-hidden="true"></span></button>
+            <button class="cell album-cell sort-header resizable-header" data-sort="album" role="columnheader" aria-sort="none">Album<span class="sort-indicator" aria-hidden="true"></span><span class="column-resizer" data-column="album" aria-hidden="true"></span></button>
+            <button class="cell year-cell sort-header resizable-header" data-sort="date" role="columnheader" aria-sort="none">Year<span class="sort-indicator" aria-hidden="true"></span><span class="column-resizer" data-column="year" aria-hidden="true"></span></button>
+            <button class="cell genre-cell sort-header resizable-header" data-sort="genre" role="columnheader" aria-sort="none">Genre<span class="sort-indicator" aria-hidden="true"></span><span class="column-resizer" data-column="genre" aria-hidden="true"></span></button>
+            <button class="cell track-cell sort-header resizable-header" data-sort="trackNumber" role="columnheader" aria-sort="none">Track<span class="sort-indicator" aria-hidden="true"></span><span class="column-resizer" data-column="track" aria-hidden="true"></span></button>
+            <button class="cell duration-cell sort-header resizable-header" data-sort="durationSeconds" role="columnheader" aria-sort="none">Duration<span class="sort-indicator" aria-hidden="true"></span><span class="column-resizer" data-column="duration" aria-hidden="true"></span></button>
+          </div>
+          <div class="table-body" id="tableBody" role="rowgroup"><div class="empty-state" id="emptyState">Import audio files or a folder to begin.</div></div>
+        </div>
+      </section>
+
+      <div class="splitter" id="splitter" role="separator" aria-label="Resize metadata panel" aria-orientation="vertical" tabindex="0"></div>
+
+      <aside class="editor-panel panel" id="editorPanel" aria-label="Metadata editor">
+        <nav class="tabs" id="editorTabs" aria-label="Metadata sections">
+          <button class="tab selected" data-tab="basic">Basic</button><button class="tab" data-tab="album">Album</button><button class="tab" data-tab="extended">Extended</button><button class="tab" data-tab="artwork">Artwork</button><button class="tab" data-tab="technical">Technical</button>
+        </nav>
+        <div class="editor-scroll" id="editorScroll">
+          <div class="editor-empty" id="editorEmpty">Select a track to inspect and edit its metadata.</div>
+          <form id="metadataForm" hidden>
+            <section class="tab-page selected" data-page="basic">
+              <div class="basic-grid">
+                <div class="artwork-card">
+                  <div class="artwork-preview" id="artworkPreview"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m4 17 5-5 4 4 2-2 5 4"/></svg><span>No artwork</span></div>
+                  <div class="artwork-actions"><button type="button" class="button micro" id="replaceArtwork">Replace…</button><button type="button" class="button micro" id="removeArtwork">Remove</button></div>
+                </div>
+                <div class="basic-fields">
+                  <label>Title<input name="title" autocomplete="off"></label>
+                  <label>Artist<input name="artist" autocomplete="off" aria-describedby="artistHelp"><small id="artistHelp">Use semicolons between multiple artists.</small></label>
+                  <label>Album<input name="album" autocomplete="off"></label>
+                  <label>Album Artist<input name="albumArtist" autocomplete="off"></label>
+                </div>
+              </div>
+              <div class="form-grid two-column"><label>Genre<input name="genre" autocomplete="off" placeholder="Semicolon-separated"></label><label>Date<input name="date" autocomplete="off" placeholder="YYYY or full date"></label></div>
+              <div class="form-grid number-grid"><label>Track Number<input name="trackNumber" inputmode="numeric"></label><label>of<input name="trackTotal" inputmode="numeric"></label><label>Disc Number<input name="discNumber" inputmode="numeric"></label><label>of<input name="discTotal" inputmode="numeric"></label></div>
+              <label>Comment<textarea name="comment" rows="2"></textarea></label>
+            </section>
+            <section class="tab-page" data-page="album">
+              <label>Album<input name="album_copy" data-mirror="album"></label><label>Album Artist<input name="albumArtist_copy" data-mirror="albumArtist"></label><div class="form-grid two-column"><label>Date<input name="date_copy" data-mirror="date"></label><label>Disc<input name="discNumber_copy" data-mirror="discNumber"></label></div>
+            </section>
+            <section class="tab-page" data-page="extended">
+              <label>Composer<input name="composer" placeholder="Semicolon-separated"></label><label>Lyrics<textarea name="lyrics" rows="7"></textarea></label><label>MusicBrainz Recording ID<input name="musicBrainzRecordingId"></label><label>MusicBrainz Release ID<input name="musicBrainzReleaseId"></label>
+            </section>
+            <section class="tab-page" data-page="artwork"><div class="large-artwork" id="largeArtwork"></div><p class="supporting-note" id="artworkDetails">No embedded artwork.</p><div class="action-row"><button type="button" class="button secondary" id="replaceArtworkLarge">Replace artwork…</button><button type="button" class="button destructive" id="removeArtworkLarge">Remove artwork</button></div></section>
+            <section class="tab-page" data-page="technical"><dl class="technical-list" id="technicalList"></dl><button type="button" class="button ghost" id="revealButton">Show in folder</button></section>
+          </form>
+          <section class="technical-summary" id="technicalSummary" hidden><div class="subsection-header"><h2>Technical Information</h2><button class="button micro" id="copyTechnical">Copy</button></div><p id="technicalLine"></p><p id="fileLine"></p></section>
+          <details class="batch-panel" id="batchPanel">
+            <summary><span>Batch Edit <span class="muted" id="batchSelection">(0 tracks selected)</span></span><svg viewBox="0 0 24 24"><path d="m6 9 6 6 6-6"/></svg></summary>
+            <div class="batch-content">
+              <div class="batch-field"><label for="batchArtistMode">Artist</label><select id="batchArtistMode"><option>KEEP</option><option>REPLACE</option><option>CLEAR</option></select><input id="batchArtistValue" disabled></div>
+              <div class="batch-field"><label for="batchAlbumMode">Album</label><select id="batchAlbumMode"><option>KEEP</option><option>REPLACE</option><option>CLEAR</option></select><input id="batchAlbumValue" disabled></div>
+              <div class="batch-field"><label for="batchGenreMode">Genre</label><select id="batchGenreMode"><option>KEEP</option><option>REPLACE</option><option>CLEAR</option></select><input id="batchGenreValue" disabled></div>
+              <div class="batch-field"><label for="batchDateMode">Date</label><select id="batchDateMode"><option>KEEP</option><option>REPLACE</option><option>CLEAR</option></select><input id="batchDateValue" disabled></div>
+              <div class="batch-artwork-row"><span>Artwork</span><button class="button micro" id="batchArtworkReplace" type="button">Replace…</button><button class="button micro" id="batchArtworkRemove" type="button">Remove</button><span class="muted" id="batchArtworkStatus">KEEP (no change)</span></div>
+              <details class="advanced-batch"><summary>Cleanup, find &amp; numbering</summary><label class="checkbox-row"><input id="cleanupStrings" type="checkbox">Trim and collapse whitespace</label><div class="form-grid two-column"><label>Find<input id="findText"></label><label>Replace<input id="replaceText"></label></div><div class="inline-row"><label class="checkbox-row"><input id="sequentialTracks" type="checkbox">Sequential tracks</label><label>Start<input id="startTrack" class="compact-number" type="number" min="1" value="1"></label></div></details>
+              <div class="action-row"><button class="button secondary" id="previewBatch" type="button">Preview Batch</button><button class="button ghost" id="renameButton" type="button">Rename Files…</button></div>
+            </div>
+          </details>
+        </div>
+      </aside>
+    </section>
+
+    <section class="activity-panel panel" id="activityPanel">
+      <div class="activity-tabs"><div role="tablist"><button class="activity-tab selected" data-activity="jobs">Jobs <span id="jobBadge">(0)</span></button><button class="activity-tab" data-activity="logs">Logs</button><button class="activity-tab" data-activity="issues">Issues <span id="issueBadge">(0)</span></button></div><button class="icon-button collapse-button" id="collapseActivity" aria-label="Collapse jobs panel"><svg viewBox="0 0 24 24"><path d="m6 15 6-6 6 6"/></svg></button></div>
+      <div class="activity-content" id="activityContent">
+        <section class="activity-page selected" data-activity-page="jobs">
+          <div class="job-status"><div class="job-main"><div class="status-row"><strong id="jobTitle">Ready</strong><span id="jobProgressText">0 / 0 tracks</span></div><progress id="jobProgress" max="100" value="0" aria-label="Current job progress"></progress><div class="status-row muted"><span id="jobCurrent">No active operation.</span><span id="jobTiming"></span></div></div><button class="button destructive" id="cancelJob" disabled>Cancel Pending</button><div class="result-counters"><div><span class="status-dot saved"></span><small id="savedLabel">Saved</small><strong id="savedCount">0</strong></div><div><span class="status-dot skipped"></span><small id="skippedLabel">Skipped</small><strong id="skippedCount">0</strong></div><div><span class="status-dot failed"></span><small>Failed</small><strong id="failedCount">0</strong></div><div><span class="status-dot conflict"></span><small id="conflictLabel">Conflict</small><strong id="jobConflictCount">0</strong></div></div></div>
+        </section>
+        <section class="activity-page" data-activity-page="logs"><div class="log-toolbar"><span>Activity Log</span><button class="button micro" id="clearLogs">Clear</button></div><div class="log-viewport" id="logViewport" role="log" aria-live="polite"><p class="muted">No activity yet.</p></div></section>
+        <section class="activity-page" data-activity-page="issues"><div class="issue-list" id="issueList"><p class="muted">No issues.</p></div></section>
+      </div>
+    </section>
+  </main>
+
+  <div class="toast-region" id="toastRegion" aria-live="polite"></div>
+
+  <dialog id="previewDialog" class="modal wide-modal"><form method="dialog"><header><div><h2>Preview Changes</h2><p class="muted" id="previewSummary"></p></div><button class="icon-button" value="cancel" aria-label="Close preview"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="change-list" id="changeList"></div><div class="modal-actions"><button class="button destructive" value="cancel">Cancel</button><button class="button primary" id="confirmSave" value="default" type="button">Confirm Save</button></div></form></dialog>
+  <dialog id="matchDialog" class="modal match-modal"><form method="dialog"><header><div><h2>Metadata Match Review</h2><p class="muted">Review suggestions by track. Applying a match only updates the draft.</p></div><button class="icon-button" value="cancel" aria-label="Close metadata match review"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><div class="match-progress" role="status" aria-live="polite"><span id="matchProgressText">Processed 0 / 0</span><span id="matchReviewedText">Reviewed 0 / 0</span></div><div class="provider-status" id="providerStatus"></div><div class="match-toolbar"><button class="button secondary" id="searchMatches" type="button">Search / Retry Batch</button><button class="button ghost" id="fingerprintMatch" type="button">Use Fingerprint for Current Track</button></div><div class="match-review-grid"><aside class="match-track-panel" aria-label="Tracks in match review"><div class="match-track-list" id="matchTrackList"></div></aside><section class="match-result-panel" aria-label="Metadata candidates"><div class="candidate-table" role="table" aria-label="Metadata match candidates"><div class="candidate-header" role="row"><span class="candidate-select-header" role="columnheader" aria-label="Select candidate"></span><span role="columnheader">Title</span><span role="columnheader">Artist</span><span role="columnheader">Album</span><button type="button" class="match-sort" data-match-sort="matchScore" role="columnheader" aria-sort="descending">Score <span aria-hidden="true">↓</span></button><button type="button" class="match-sort" data-match-sort="source" role="columnheader" aria-sort="none">Source <span aria-hidden="true"></span></button></div><div class="candidate-list" id="candidateList" role="rowgroup"><p class="empty-state">Start Auto Match to review metadata candidates.</p></div></div><div class="match-comparison" id="matchComparison"><p class="empty-state">Select a candidate to compare current and proposed metadata.</p></div></section></div><div class="modal-actions"><button class="button destructive" value="cancel">Close</button><button class="button secondary" id="applyMatch" type="button" disabled>Apply Current to Draft</button><button class="button primary" id="applyReviewedMatches" type="button" disabled>Apply Reviewed to Draft</button></div></form></dialog>
+  <dialog id="renameDialog" class="modal"><form method="dialog"><header><div><h2>Output Name Preview</h2><p class="muted">Renamed copies are created in Output; source files never move.</p></div><button class="icon-button" value="cancel" aria-label="Close rename"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><label>Template<input id="renameTemplate" value="{trackNumber:02} - {artist} - {title}"></label><p class="supporting-note">Tokens: title, artist, album, date, trackNumber, discNumber, genre.</p><button class="button secondary" id="generateRename" type="button">Generate Preview</button><div class="rename-list" id="renameList"></div><div class="modal-actions"><button class="button destructive" value="cancel">Cancel</button><button class="button primary" id="applyRename" type="button" disabled>Create Renamed Copies</button></div></form></dialog>
+  <dialog id="settingsDialog" class="modal"><form method="dialog"><header><div><h2>Settings</h2><p class="muted">Local preferences and optional provider credentials.</p></div><button class="icon-button" value="cancel" aria-label="Close settings"><svg viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></svg></button></header><label class="checkbox-row"><input id="recursiveSetting" type="checkbox">Scan imported folders recursively</label><label>AcoustID API key<input id="acoustIdKey" type="password" autocomplete="off" placeholder="Unchanged when left blank"></label><label>Discogs personal access token<input id="discogsToken" type="password" autocomplete="off" placeholder="Unchanged when left blank"></label><p class="supporting-note">Credentials are optional, stored only in local app settings, and never included in logs.</p><label>fpcalc executable path<input id="fpcalcPath" type="text" autocomplete="off" placeholder="Auto-detect from PATH and common locations"></label><p class="supporting-note">Optional. On macOS, install Chromaprint with <code>brew install chromaprint</code>, or enter the full fpcalc path here.</p><div class="modal-actions"><button class="button destructive" value="cancel">Cancel</button><button class="button primary" id="saveSettings" type="button">Save Settings</button></div></form></dialog>
+
+  <script type="module" src="components/app.js"></script>
+</body>
+</html>
