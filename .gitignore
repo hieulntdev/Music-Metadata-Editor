@@ -3,42 +3,30 @@
 Thumbs.db
 Desktop.ini
 
-# Editor and IDE state
+# Local editor state and temporary files
 .idea/
 .vscode/
 *.swp
 *.swo
 *~
 
-# Node.js dependencies and package-manager caches
+# npm-installed dependencies and local cache/logs
 node_modules/
 .npm/
-.yarn/
-.pnpm-store/
 npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-pnpm-debug.log*
 
-# Python environments, bytecode, and tool caches
+# Python virtual environments, bytecode, and local tool caches
 .venv/
 .venv-*/
 venv/
-env/
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.tox/
-.nox/
-.coverage
-.coverage.*
-htmlcov/
-.python-version
 
-# Local environment and secrets (keep only a sanitized template if added)
+# Local environment and private key material. Sanitized templates stay visible.
 .env
 .env.*
 !.env.example
@@ -47,47 +35,15 @@ htmlcov/
 *.p12
 *.pfx
 
-# Build and packaging output
-build/
-dist/
-out/
-release/
-releases/
-target/
-coverage/
-*.app
-*.dmg
-*.pkg
-*.exe
-*.msi
-*.deb
-*.rpm
-*.AppImage
-*.asar
-
-# Runtime output and local application data
-/logs/
-/tmp/
-/temp/
-/cache/
-/.cache/
+# User-selected application output must never become source.
 /output/
 /outputs/
 /downloads/
-/generated/
-/runtime/
-/sessions/
+
+# Local logs and temporary/backup files
 *.log
 *.tmp
 *.temp
-*.sqlite
-*.sqlite3
-*.sqlite-*
-*.db
-*.db-*
-*.metadata-backup*
-
-# Manual/editor backup files
 *.bak
 *.backup
 *.old
