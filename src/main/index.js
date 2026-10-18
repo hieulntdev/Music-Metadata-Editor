@@ -8,6 +8,7 @@ const { PythonBridge } = require('./workers/python-bridge');
 const { JobManager } = require('./jobs/job-manager');
 const { MusicBrainzService, candidatesFromAcoustId } = require('./services/musicbrainz.service');
 const { MetadataMatchService, normalizeCandidate, calculateMatchScore, classifyMatchResult } = require('./services/metadata-match.service');
+const { LrclibService, validateLrc } = require('./services/lrclib.service');
 const { validateTemplate } = require('./services/rename.service');
 const { buildBatchPatch, changesForPatch } = require('./services/batch-metadata.service');
 const { beginMatchStatus, reviewedStatus, savedStatus } = require('./services/record-workflow');
@@ -25,6 +26,7 @@ const outputFolderSession = new OutputFolderSession();
 const jobs = new JobManager();
 const musicBrainz = new MusicBrainzService();
 const metadataMatcher = new MetadataMatchService({ musicBrainz, getSettings: readSettings });
+const lrclib = new LrclibService({ userAgent: `MusicMetadataEditor/${app.getVersion() || '1.1.0'}` });
 const shutdownController = new AbortController();
 let worker;
 let mainWindow;
@@ -34,7 +36,13 @@ let shutdownComplete = false;
 let shutdownPromise = null;
 
 function settingsPath() { return path.join(app.getPath('userData'), 'settings.json'); }
-function defaults() { return { theme: 'light', recursiveImport: true, panelRatio: 0.65, acoustIdApiKey: '', discogsToken: '', fpcalcPath: '' }; }
+function defaults() {
+  return {
+    theme: 'light', recursiveImport: true, panelRatio: 0.65, acoustIdApiKey: '', discogsToken: '', fpcalcPath: '',
+    enableLyricsLookup: true, preferSyncedLyrics: true, preserveExistingLyrics: true,
+    exportLrcSidecar: false, requireLyricsReview: true
+  };
+}
 
 function readSettings() {
   try {
@@ -52,6 +60,9 @@ function writeSettings(patch) {
   if (typeof patch.acoustIdApiKey === 'string' && patch.acoustIdApiKey.length <= 200) allowed.acoustIdApiKey = patch.acoustIdApiKey.trim();
   if (typeof patch.discogsToken === 'string' && patch.discogsToken.length <= 500) allowed.discogsToken = patch.discogsToken.trim();
   if (Object.hasOwn(patch, 'fpcalcPath')) allowed.fpcalcPath = string(patch.fpcalcPath, 'fpcalcPath', { max: 4096 }).trim();
+  for (const name of ['enableLyricsLookup', 'preferSyncedLyrics', 'preserveExistingLyrics', 'exportLrcSidecar', 'requireLyricsReview']) {
+    if (typeof patch[name] === 'boolean') allowed[name] = patch[name];
+  }
   const next = { ...current, ...allowed };
   fs.mkdirSync(path.dirname(settingsPath()), { recursive: true });
   fs.writeFileSync(settingsPath(), JSON.stringify(next, null, 2), { mode: 0o600 });
@@ -279,7 +290,7 @@ async function runLayoutSmokeTest() {
     const candidateTable = matchDialog.querySelector('.candidate-table');
     const headings = [...matchDialog.querySelectorAll('.candidate-header > *')].map((item) => item.textContent.trim().split(/\\s+/)[0]);
     const candidateRows = [...matchDialog.querySelectorAll('.candidate')];
-    const headerCells = [...matchDialog.querySelectorAll('.candidate-header > *')];
+    const headerCells = [...matchDialog.querySelectorAll('.candidate-header > *')].filter((cell) => getComputedStyle(cell).display !== 'none');
     const firstCells = [...candidateRows[0].querySelectorAll(':scope > [role="cell"]')];
     const columnAligned = firstCells.every((cell, index) => {
       const cellBox = cell.getBoundingClientRect(); const headingBox = headerCells[index].getBoundingClientRect();
@@ -369,6 +380,61 @@ async function runLayoutSmokeTest() {
     };
     previewDialog.close();
 
+    const editorTabOrder = [...document.querySelectorAll('#editorTabs .tab')].map((tab) => tab.dataset.tab);
+    document.querySelector('[data-tab="lyrics"]').click();
+    const lyricsPage = document.querySelector('[data-page="lyrics"]');
+    const plainLyrics = document.getElementById('plainLyrics');
+    const syncedLyrics = document.getElementById('syncedLyrics');
+    plainLyrics.value = Array.from({ length: 80 }, (_, index) => 'Unicode lời bài hát ' + index).join('\\n');
+    plainLyrics.dispatchEvent(new Event('input', { bubbles: true }));
+    syncedLyrics.value = '[00:01.00] Dòng một\\n[00:02.00] Dòng hai';
+    syncedLyrics.dispatchEvent(new Event('input', { bubbles: true }));
+    document.querySelector('[data-tab="basic"]').click();
+    document.querySelector('[data-tab="lyrics"]').click();
+    plainLyrics.scrollTop = plainLyrics.scrollHeight;
+    const lyricsLayout = {
+      exactTabOrder: editorTabOrder.join('|') === 'basic|album|extended|artwork|lyrics|technical',
+      pageInsideEditor: lyricsPage.closest('#metadataForm') !== null && lyricsPage.classList.contains('selected'),
+      draftsStayPerFile: state.drafts.get('layout-smoke-track')?.lyrics === plainLyrics.value && state.drafts.get('layout-smoke-track')?.syncedLyrics === syncedLyrics.value,
+      plainAndSyncedSeparate: plainLyrics.value !== syncedLyrics.value,
+      lrcValid: document.getElementById('syncedLyrics').getAttribute('aria-invalid') === 'false',
+      contentOwnsScroll: plainLyrics.scrollHeight > plainLyrics.clientHeight && getComputedStyle(plainLyrics).overflowY === 'auto'
+    };
+
+    const lyricsCandidate = {
+      id: 7001, trackName: 'Layout smoke track', artistName: 'Test artist', albumName: 'Test album', duration: 245,
+      instrumental: false, plainLyrics: 'Plain preview', syncedLyrics: '[00:01.00] Synced preview', score: 78,
+      confidence: 'medium', matchReason: 'Top candidates require review.'
+    };
+    for (let index = 0; index < 50; index += 1) {
+      const fileId = index ? 'lyrics-review-' + index : 'layout-smoke-track';
+      if (index) state.records.push({ ...state.records[0], fileId, absolutePath: '/synthetic/lyrics-review-' + index + '.flac', metadata: { ...state.records[0].metadata, title: 'Lyrics review ' + index } });
+      state.lyricsById.set(fileId, { fileId, status: 'reviewRequired', source: 'LRCLIB', confidence: 'medium', reason: 'Ambiguous match', candidate: lyricsCandidate, candidates: [lyricsCandidate], reviewed: false });
+    }
+    state.activeId = 'layout-smoke-track';
+    document.querySelector('.table-row')?.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    document.getElementById('reviewLyrics').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const lyricsReviewBox = matchDialog.getBoundingClientRect();
+    const lyricsTrackPanel = matchDialog.querySelector('.match-track-panel');
+    const lyricsRows = [...matchDialog.querySelectorAll('.candidate')];
+    const hasEightColumns = lyricsRows[0]?.querySelectorAll(':scope > [role="cell"]').length === 8;
+    const startsUnselected = !lyricsRows[0]?.querySelector('input[type="radio"]').checked && document.getElementById('applyMatch').disabled;
+    lyricsRows[0]?.querySelector('input[type="radio"]').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const lyricsReviewLayout = {
+      reusesMatchDialog: matchDialog.open && document.getElementById('matchDialogTitle').textContent === 'Lyrics Match Review',
+      rendersFiftyTracks: matchDialog.querySelectorAll('.match-track').length === 50,
+      trackListOwnsScroll: lyricsTrackPanel.scrollHeight > lyricsTrackPanel.clientHeight && getComputedStyle(lyricsTrackPanel).overflowY === 'auto',
+      fitsViewport: lyricsReviewBox.left >= 0 && lyricsReviewBox.right <= innerWidth && lyricsReviewBox.top >= 0 && lyricsReviewBox.bottom <= innerHeight,
+      hasEightColumns,
+      startsUnselected,
+      selectionEnablesApply: !document.getElementById('applyMatch').disabled,
+      previewsLyrics: document.getElementById('matchComparison').textContent.includes('Synced preview')
+    };
+    matchDialog.close();
+
     document.getElementById('clearButton').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     const clear = {
@@ -380,7 +446,7 @@ async function runLayoutSmokeTest() {
       issuesReset: state.issues.length === 0 && document.getElementById('issueBadge').textContent === '(0)',
       themePreserved: root.dataset.theme === originalTheme
     };
-    return { switchedTheme, restoredTheme, horizontalGrid, matchReview, previewLayout, clear };
+    return { switchedTheme, restoredTheme, horizontalGrid, matchReview, previewLayout, lyricsLayout, lyricsReviewLayout, clear };
   })()`);
   const virtualization = await mainWindow.webContents.executeJavaScript(`(async () => {
     const { state } = await import('./state/app-state.js');
@@ -403,6 +469,8 @@ async function runLayoutSmokeTest() {
     || Object.values(interactions.horizontalGrid).some((value) => !value)
     || Object.values(interactions.matchReview).some((value) => !value)
     || Object.values(interactions.previewLayout).some((value) => !value)
+    || Object.values(interactions.lyricsLayout).some((value) => !value)
+    || Object.values(interactions.lyricsReviewLayout).some((value) => !value)
     || Object.values(interactions.clear).some((value) => !value)
     || virtualization.total !== 1250 || virtualization.renderedRows >= 100;
   console.log(`LAYOUT_SMOKE ${JSON.stringify({ passed: !failed, results, interactions, virtualization })}`);
@@ -519,6 +587,45 @@ function savePreview(type, entries, extra = {}) {
   return preview;
 }
 
+function lookupMetadata(input, record) {
+  const value = input && typeof input === 'object' && !Array.isArray(input) ? input : record.metadata || {};
+  const title = typeof value.title === 'string' ? value.title.slice(0, 1000) : '';
+  const album = typeof value.album === 'string' ? value.album.slice(0, 1000) : '';
+  const rawArtist = Array.isArray(value.artist) ? value.artist : typeof value.artist === 'string' ? [value.artist] : [];
+  return { title, album, artist: rawArtist.filter((item) => typeof item === 'string').slice(0, 20).map((item) => item.slice(0, 1000)) };
+}
+
+function addLyricsOutputPlan(entry, record) {
+  const synced = Object.hasOwn(entry.patch || {}, 'syncedLyrics') ? entry.patch.syncedLyrics : record.metadata?.syncedLyrics;
+  const exportSidecar = Boolean(synced) && readSettings().exportLrcSidecar;
+  const sidecarPath = path.join(path.dirname(entry.outputPath), `${path.basename(entry.outputPath, path.extname(entry.outputPath))}.lrc`);
+  const sidecarConflict = fs.existsSync(sidecarPath);
+  if (!exportSidecar) return {
+    ...entry, exportLrcSidecar: false, sidecarPath: null,
+    lyricsWarning: synced && sidecarConflict
+      ? `An existing ${path.basename(sidecarPath)} may take priority over embedded lyrics in Navidrome.`
+      : null
+  };
+  return {
+    ...entry, patch: { ...entry.patch, syncedLyrics: synced }, exportLrcSidecar: true, sidecarPath,
+    outputConflict: entry.outputConflict || (sidecarConflict ? 'OUTPUT_EXISTS' : null),
+    changes: [...entry.changes, { field: 'LRC sidecar', before: '(none)', after: sidecarPath }]
+  };
+}
+
+function emitLyricsLookupDiagnostic(result) {
+  const candidate = result?.candidate;
+  const synced = candidate?.syncedLyrics || '';
+  const validation = validateLrc(synced);
+  const syncedLines = validation.valid ? String(synced).split(/\r?\n/u).filter((line) => /\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]/u.test(line)).length : 0;
+  send('worker:diagnostic', { message: '[Lyrics] Source: LRCLIB' });
+  send('worker:diagnostic', { message: `[Lyrics] Plain: ${candidate?.plainLyrics ? 'Available' : 'Unavailable'}` });
+  send('worker:diagnostic', { message: `[Lyrics] Synced: ${synced ? 'Available' : 'Unavailable'}` });
+  send('worker:diagnostic', { message: `[Lyrics] Synced lines: ${syncedLines}` });
+  if (synced && !validation.valid) send('worker:diagnostic', { message: '[Lyrics] Timestamp validation: Failed' });
+  send('worker:diagnostic', { message: `[Lyrics] Lookup result: ${result?.status || 'unknown'}` });
+}
+
 function getPreview(previewId, type) {
   const preview = previews.get(string(previewId, 'previewId', { max: 64, allowEmpty: false }));
   if (!preview || preview.type !== type || Date.now() - preview.createdAt > 10 * 60 * 1000) {
@@ -621,14 +728,14 @@ function registerIpc() {
     const artworkOperation = resolveArtworkOperation(request.artworkOperation);
     const result = await worker.request('preview_changes', { path: record.absolutePath, signature: signature(record), patch, artworkOperation });
     let entries = [{ fileId: record.fileId, path: record.absolutePath, signature: signature(record), patch, artworkOperation, changes: result.changes, conflict: result.conflict }];
-    entries = planOutputEntries(entries, outputFolderSession.current, [...importedRoots]);
+    entries = planOutputEntries(entries, outputFolderSession.current, [...importedRoots]).map((entry) => addLyricsOutputPlan(entry, record));
     updateRecordStatus(record.fileId, {
       conflict: Boolean(entries[0].conflict || entries[0].outputConflict),
       conflictError: entries[0].outputConflict || (entries[0].conflict ? 'FILE_CHANGED' : null)
     });
     return savePreview('metadata', entries, {
       conflicts: entries[0].conflict || entries[0].outputConflict ? 1 : 0,
-      warnings: result.writable ? [] : [result.readOnlyReason],
+      warnings: [...(result.writable ? [] : [result.readOnlyReason]), ...(entries[0].lyricsWarning ? [entries[0].lyricsWarning] : [])],
       outputFolder: entries[0].outputFolder
     });
   });
@@ -651,7 +758,8 @@ function registerIpc() {
       return {
         sourceRecord: await markSourceSaved(entry.fileId, result.outputPath),
         outputRecord: result.record,
-        outputPath: result.outputPath
+        outputPath: result.outputPath,
+        sidecarPath: result.sidecarPath || null
       };
     } catch (error) {
       updateRecordStatus(entry.fileId, {
@@ -695,7 +803,15 @@ function registerIpc() {
       } catch { conflict = true; }
       entries.push({ fileId: snapshot.fileId, path: record.absolutePath, signature: signature(record), patch, artworkOperation, changes, conflict, writable: record.capabilities?.writeTags !== false });
     }
-    const planned = planOutputEntries(entries, outputFolderSession.current, [...importedRoots]);
+    let planned = planOutputEntries(entries, outputFolderSession.current, [...importedRoots])
+      .map((entry) => addLyricsOutputPlan(entry, recordFor(entry.fileId)));
+    const sidecarCounts = new Map();
+    for (const entry of planned) if (entry.sidecarPath) {
+      const key = pathKey(entry.sidecarPath); sidecarCounts.set(key, (sidecarCounts.get(key) || 0) + 1);
+    }
+    planned = planned.map((entry) => entry.sidecarPath && sidecarCounts.get(pathKey(entry.sidecarPath)) > 1
+      ? { ...entry, outputConflict: entry.outputConflict || 'DUPLICATE_OUTPUT', conflict: true }
+      : entry);
     for (const entry of planned) {
       updateRecordStatus(entry.fileId, {
         conflict: Boolean(entry.conflict || entry.outputConflict),
@@ -707,6 +823,8 @@ function registerIpc() {
     const warnings = [];
     if (readOnly) warnings.push(`${readOnly} read-only file(s) will fail.`);
     if (conflicts) warnings.push(`${conflicts} source or Output name conflict(s) will be reported without overwriting files.`);
+    const lyricsPriorityWarnings = planned.filter((entry) => entry.lyricsWarning).length;
+    if (lyricsPriorityWarnings) warnings.push(`${lyricsPriorityWarnings} file(s) have an existing LRC sidecar that may take priority over embedded lyrics in Navidrome.`);
     return savePreview('batch', planned, {
       affected: planned.filter((entry) => entry.changes.length).length,
       operations, conflicts, warnings, outputFolder: planned[0]?.outputFolder || validateOutputFolder(outputFolderSession.current, [], [...importedRoots])
@@ -723,7 +841,7 @@ function registerIpc() {
         validateOutputFolder(entry.outputFolder, [entry.path], [...importedRoots]);
         const result = await withOutputLock(entry, () => worker.request('save_metadata', entry, 120000));
         await markSourceSaved(entry.fileId, result.outputPath);
-        return { status: 'saved', result: { fileId: entry.fileId, outputPath: result.outputPath } };
+        return { status: 'saved', result: { fileId: entry.fileId, outputPath: result.outputPath, sidecarPath: result.sidecarPath || null } };
       } catch (error) {
         updateRecordStatus(entry.fileId, {
           processingStatus: 'error',
@@ -852,6 +970,27 @@ function registerIpc() {
     return { ...matches, candidates, fingerprintGenerated: true, noMatch: candidates.length === 0 };
   });
   handle('match:cover-url', async (payload) => ({ url: musicBrainz.coverArtUrl(string(object(payload).releaseId, 'releaseId', { max: 64 })) }));
+
+  handle('lyrics:search', async (payload) => {
+    const request = object(payload, 'lyrics request');
+    const record = recordFor(string(request.fileId, 'fileId', { max: 128, allowEmpty: false }));
+    const result = await lrclib.lookup(record, lookupMetadata(request.metadata, record), { signal: shutdownController.signal });
+    emitLyricsLookupDiagnostic(result);
+    return result;
+  });
+  handle('lyrics:batch-start', async (payload) => {
+    const request = object(payload, 'lyrics batch');
+    const items = Array.isArray(request.items) ? request.items : [];
+    const ids = autoMatchFileIds(items.map((item) => item?.fileId));
+    const metadataById = new Map(items.map((item) => [item.fileId, item.metadata]));
+    if (jobs.hasActiveType('lyrics-lookup')) throw new AppError('LYRICS_LOOKUP_IN_PROGRESS', 'A lyrics lookup batch is already running.');
+    return jobs.create('lyrics-lookup', ids.map(recordFor), async (record, _job, context) => {
+      const result = await lrclib.lookup(record, lookupMetadata(metadataById.get(record.fileId), record), context);
+      emitLyricsLookupDiagnostic(result);
+      const status = result.status === 'notFound' ? 'noMatch' : 'matched';
+      return { status, result };
+    }, { concurrency: 1, inProgressStatus: 'searching', publicData: { provider: 'LRCLIB' } });
+  });
 
   handle('jobs:cancel', async (payload) => ({ canceled: jobs.cancel(string(object(payload).jobId, 'jobId', { max: 64, allowEmpty: false })) }));
   handle('system:open-path', async (payload) => {

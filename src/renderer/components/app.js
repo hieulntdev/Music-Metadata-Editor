@@ -13,6 +13,8 @@ const reportedJobErrors = new Set();
 const reportedJobOutputs = new Set();
 const reportedJobCompletions = new Set();
 const reportedProviderErrors = new Set();
+const reportedLyricsResults = new Set();
+const queuedLyricsIds = new Set();
 const MAX_AUTO_MATCH_TRACKS = 50;
 const MAX_BATCH_SAVE_TRACKS = 50;
 let matchSort = { column: 'matchScore', direction: 'desc' };
@@ -20,6 +22,9 @@ let previewPending = false;
 let controlsLocked = false;
 let previewJobId = null;
 let previewItemStatuses = new Map();
+let lyricsReviewMode = false;
+let lyricsReviewActiveId = null;
+const lyricsReviewSelections = new Map();
 
 function unwrap(response) {
   if (response?.ok) return response.result;
@@ -172,12 +177,15 @@ function fillEditor(record) {
   $('#technicalLine').textContent = `${record.format}  |  ${record.sampleRate ? `${record.sampleRate / 1000} kHz` : 'Unknown'}  |  ${record.bitDepth ? `${record.bitDepth}-bit` : 'Unknown'}  |  ${record.channels || '—'} ch  |  ${duration(record.durationSeconds)}`;
   $('#fileLine').textContent = `File: ${record.absolutePath}  •  Size: ${formatBytes(record.fileSize)}`;
   $('#removeArtwork').disabled = !art && op?.mode !== 'replace'; $('#removeArtworkLarge').disabled = $('#removeArtwork').disabled;
+  renderLyrics(record);
   renderSummary();
 }
 
 async function activateTrack(fileId) {
   state.activeId = fileId; const existing = getRecord(fileId); if (!existing) return;
   fillEditor(existing);
+  const currentLyrics = metadataFor(fileId);
+  selectLyricsKind(state.settings.preferSyncedLyrics && currentLyrics.syncedLyrics ? 'synced' : 'plain');
   if (!existing.artwork?.some((item) => item.previewDataUrl)) {
     const fresh = await guarded(async () => unwrap(await window.musicApp.metadata.get(fileId)), 'Reading full metadata…');
     if (fresh) { replaceRecord(fresh, false); fillEditor(fresh); table.render(); }
@@ -191,6 +199,222 @@ function formatBytes(bytes) {
 }
 
 function duration(seconds) { const value = Math.round(Number(seconds) || 0); return `${Math.floor(value / 60)}:${String(value % 60).padStart(2, '0')}`; }
+
+function validateLrc(value) {
+  if (!value) return { valid: true, errors: [] };
+  const errors = []; let previous = -1; let timedLines = 0;
+  String(value).split(/\r?\n/u).forEach((line, index) => {
+    if (!line.trim() || /^\[(?:ar|al|ti|au|by|length|offset|re):/iu.test(line.trim())) return;
+    const stamps = [...line.matchAll(/\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]/gu)];
+    if (!stamps.length) { errors.push(`Line ${index + 1}: missing or malformed timestamp`); return; }
+    timedLines += 1;
+    for (const match of stamps) {
+      const seconds = Number(match[1]) * 60 + Number(match[2]) + Number(`0.${match[3] || 0}`);
+      if (Number(match[2]) >= 60 || !Number.isFinite(seconds)) errors.push(`Line ${index + 1}: invalid timestamp`);
+      else if (seconds < previous) errors.push(`Line ${index + 1}: timestamp is out of order`);
+      previous = Math.max(previous, seconds);
+    }
+  });
+  if (String(value).trim() && !timedLines && !errors.length) errors.push('No timestamped lyric line');
+  return { valid: errors.length === 0, errors };
+}
+
+function lyricsInfo(fileId) {
+  let info = state.lyricsById.get(fileId);
+  if (!info) {
+    const record = getRecord(fileId); const plain = record?.metadata?.lyrics || ''; const synced = record?.metadata?.syncedLyrics || '';
+    info = {
+      fileId, status: plain || synced ? 'found' : 'notSearched', source: plain || synced ? 'Embedded' : '—',
+      confidence: null, reason: '', candidate: null, candidates: [], reviewed: false, searchedAt: null, lastError: null
+    };
+    state.lyricsById.set(fileId, info);
+  }
+  return info;
+}
+
+function lyricsType(metadata) {
+  const plain = Boolean(metadata?.lyrics); const synced = Boolean(metadata?.syncedLyrics);
+  return plain && synced ? 'Both' : synced ? 'Synced' : plain ? 'Plain' : 'None';
+}
+
+function renderLyrics(record) {
+  if (!record) return;
+  const info = lyricsInfo(record.fileId); const metadata = metadataFor(record.fileId);
+  const labels = { notSearched: 'Not searched', searching: 'Searching…', found: 'Found', reviewRequired: 'Review Required', notFound: 'Not Found', instrumental: 'Instrumental', failed: 'Failed', cancelled: 'Cancelled', saved: 'Saved' };
+  $('#lyricsStatus').textContent = labels[info.status] || info.status;
+  $('#lyricsStatus').className = `lyrics-status ${info.status}`;
+  $('#lyricsSource').textContent = info.source || '—';
+  $('#lyricsConfidence').textContent = info.confidence ? `${info.confidence[0].toUpperCase()}${info.confidence.slice(1)}${info.candidate?.score !== undefined ? ` (${info.candidate.score})` : ''}` : '—';
+  $('#lyricsType').textContent = info.status === 'instrumental' ? 'Instrumental' : lyricsType(metadata);
+  $('#lyricsReason').textContent = info.lastError?.message || info.reason || '';
+  $('#searchLyrics').disabled = info.status === 'searching' || !state.settings.enableLyricsLookup;
+  $('#searchLyrics').title = state.settings.enableLyricsLookup ? '' : 'Enable Lyrics Lookup in Settings first.';
+  $('#searchLyrics').textContent = info.status === 'searching' ? 'Searching…' : 'Search Lyrics';
+  $('#reviewLyrics').disabled = !info.candidates?.length;
+  $('#keepExistingLyrics').hidden = !(record.metadata?.lyrics || record.metadata?.syncedLyrics);
+  $('#clearLyrics').disabled = !metadata.lyrics && !metadata.syncedLyrics;
+  $('#reviewLyrics').textContent = 'Review Match';
+  const lrc = validateLrc(metadata.syncedLyrics || '');
+  $('#lrcValidation').textContent = lrc.valid ? 'Timestamps are valid; the original LRC text will be preserved.' : lrc.errors.slice(0, 2).join(' • ');
+  $('#lrcValidation').classList.toggle('invalid', !lrc.valid);
+  $('#syncedLyrics').setAttribute('aria-invalid', String(!lrc.valid));
+}
+
+function selectLyricsKind(kind) {
+  for (const button of $$('.lyrics-kind')) {
+    const selected = button.dataset.lyricsKind === kind;
+    button.classList.toggle('selected', selected); button.setAttribute('aria-selected', String(selected));
+  }
+  $$('.lyrics-editor').forEach((editor) => editor.classList.toggle('selected', editor.dataset.lyricsEditor === kind));
+}
+
+function lyricsCandidateType(candidate) {
+  return candidate.plainLyrics && candidate.syncedLyrics ? 'Both' : candidate.syncedLyrics ? 'Synced' : candidate.plainLyrics ? 'Plain' : candidate.instrumental ? 'Instrumental' : 'No lyrics';
+}
+
+function setMatchDialogMode(mode) {
+  lyricsReviewMode = mode === 'lyrics';
+  $('#matchDialogTitle').textContent = lyricsReviewMode ? 'Lyrics Match Review' : 'Metadata Match Review';
+  $('#matchDialogDescription').textContent = lyricsReviewMode
+    ? 'Review LRCLIB candidates by track. Applying lyrics only updates the per-file draft.'
+    : 'Review suggestions by track. Applying a match only updates the draft.';
+  $('#matchToolbar').hidden = lyricsReviewMode;
+  $('#candidateTable').classList.toggle('lyrics-review', lyricsReviewMode);
+  $('#applyMatch').textContent = lyricsReviewMode ? 'Apply Current Lyrics' : 'Apply Current to Draft';
+  $('#applyReviewedMatches').textContent = lyricsReviewMode ? 'Apply Reviewed Lyrics' : 'Apply Reviewed to Draft';
+}
+
+function lyricsReviewFileIds() {
+  const ids = [...state.lyricsById.entries()]
+    .filter(([fileId, info]) => getRecord(fileId) && info.candidates?.length && info.status === 'reviewRequired')
+    .map(([fileId]) => fileId);
+  if (state.activeId && lyricsInfo(state.activeId).candidates?.length && !ids.includes(state.activeId)) ids.unshift(state.activeId);
+  return ids.slice(0, MAX_AUTO_MATCH_TRACKS);
+}
+
+function openLyricsReview() {
+  const fileIds = lyricsReviewFileIds();
+  if (!fileIds.length) return;
+  setMatchDialogMode('lyrics');
+  lyricsReviewActiveId = fileIds.includes(state.activeId) ? state.activeId : fileIds[0];
+  renderLyricsMatchReview();
+  if (!$('#matchDialog').open) $('#matchDialog').showModal();
+}
+
+function renderLyricsMatchReview() {
+  if (!lyricsReviewMode) return;
+  const fileIds = lyricsReviewFileIds();
+  $('#matchProgressText').textContent = `${fileIds.length} track(s) require lyrics review`;
+  $('#matchReviewedText').textContent = `Selected ${[...lyricsReviewSelections.keys()].filter((id) => fileIds.includes(id)).length} / ${fileIds.length}`;
+  $('#providerStatus').textContent = 'LRCLIB • read-only lyrics provider';
+  const tracks = $('#matchTrackList'); tracks.replaceChildren();
+  for (const fileId of fileIds) {
+    const button = document.createElement('button'); button.type = 'button'; button.className = `match-track${lyricsReviewActiveId === fileId ? ' selected' : ''}`;
+    const name = document.createElement('span'); name.className = 'match-track-name'; name.textContent = metadataFor(fileId).title || getRecord(fileId).absolutePath.split(/[\\/]/).pop();
+    const status = document.createElement('span'); status.className = 'match-track-status'; status.textContent = lyricsReviewSelections.has(fileId) ? 'Selected' : 'Review';
+    button.append(name, status); button.addEventListener('click', () => { lyricsReviewActiveId = fileId; state.activeId = fileId; activateTrack(fileId); renderLyricsMatchReview(); }); tracks.append(button);
+  }
+  const info = lyricsInfo(lyricsReviewActiveId); const candidates = info.candidates || []; const chosen = lyricsReviewSelections.get(lyricsReviewActiveId);
+  const list = $('#candidateList'); list.replaceChildren();
+  for (const candidate of candidates) {
+    const label = document.createElement('label'); const selected = chosen?.id === candidate.id;
+    label.className = `candidate${selected ? ' selected' : ''}`; label.setAttribute('role', 'row');
+    const radio = document.createElement('input'); radio.type = 'radio'; radio.name = `lyrics-candidate-${lyricsReviewActiveId}`; radio.checked = selected;
+    radio.setAttribute('aria-label', `Select lyrics for ${candidate.trackName || 'candidate'}`);
+    const selectionCell = document.createElement('span'); selectionCell.className = 'candidate-select'; selectionCell.setAttribute('role', 'cell'); selectionCell.append(radio); label.append(selectionCell);
+    const values = [candidate.trackName || '—', candidate.artistName || '—', candidate.albumName || '—', duration(candidate.duration), lyricsCandidateType(candidate), candidate.score ?? '—', 'LRCLIB'];
+    for (const value of values) { const cell = document.createElement('span'); cell.setAttribute('role', 'cell'); cell.textContent = String(value); cell.title = String(value); label.append(cell); }
+    label.addEventListener('change', () => { lyricsReviewSelections.set(lyricsReviewActiveId, candidate); renderLyricsMatchReview(); }); list.append(label);
+  }
+  const preview = $('#matchComparison'); preview.replaceChildren();
+  if (chosen) {
+    const content = document.createElement('pre'); content.className = 'lyrics-review-preview';
+    content.textContent = chosen.instrumental ? 'Instrumental' : chosen.syncedLyrics || chosen.plainLyrics || 'This LRCLIB record contains no lyrics.'; preview.append(content);
+  } else { const empty = document.createElement('p'); empty.className = 'empty-state'; empty.textContent = 'Select a candidate to preview Plain or Synced lyrics.'; preview.append(empty); }
+  $('#applyMatch').disabled = !chosen;
+  $('#applyReviewedMatches').disabled = !fileIds.some((id) => lyricsReviewSelections.has(id));
+}
+
+function applyLyricsCandidate(fileId, candidate, { reviewed = false } = {}) {
+  if (!candidate) return;
+  const info = lyricsInfo(fileId); const existing = metadataFor(fileId);
+  if (candidate.instrumental) {
+    info.status = 'instrumental'; info.reason = 'LRCLIB marks this recording as instrumental.';
+  } else {
+    setDraftField(fileId, 'lyrics', candidate.plainLyrics || '');
+    setDraftField(fileId, 'syncedLyrics', candidate.syncedLyrics || '');
+    info.status = 'found'; info.reason = candidate.matchReason || 'Reviewed LRCLIB match.';
+  }
+  info.source = 'LRCLIB'; info.candidate = candidate; info.confidence = candidate.confidence; info.reviewed = reviewed;
+  info.reviewing = false; info.searchedAt = new Date().toISOString(); info.lastError = null;
+  if (state.activeId === fileId) { fillEditor(getRecord(fileId)); renderLyrics(getRecord(fileId)); }
+  renderSummary();
+}
+
+function applyLyricsLookupResult(fileId, result, { automatic = false } = {}) {
+  const info = lyricsInfo(fileId); const record = getRecord(fileId); if (!record) return;
+  lyricsReviewSelections.delete(fileId);
+  info.status = result.status; info.candidate = result.candidate || null; info.candidates = result.candidates || [];
+  info.confidence = result.candidate?.confidence || null; info.reason = result.reason || ''; info.source = result.candidate ? 'LRCLIB' : info.source;
+  info.searchedAt = new Date().toISOString(); info.lastError = null;
+  const currentLyrics = metadataFor(fileId);
+  const hasExisting = Boolean(currentLyrics.lyrics || currentLyrics.syncedLyrics);
+  const acceptedStatus = result.status === 'found' || (!state.settings.requireLyricsReview && result.status === 'reviewRequired' && result.candidate?.confidence === 'medium' && !result.candidate?.versionMismatch);
+  const canApply = result.candidate && !result.candidate.instrumental && acceptedStatus
+    && !(state.settings.preserveExistingLyrics && hasExisting);
+  if (canApply) applyLyricsCandidate(fileId, result.candidate, { reviewed: !automatic });
+  else if (hasExisting && result.candidate && state.settings.preserveExistingLyrics) {
+    info.status = 'reviewRequired'; info.reason = 'Existing or pending lyrics are preserved until you explicitly choose a replacement.';
+  }
+  if (state.activeId === fileId) renderLyrics(record);
+}
+
+async function searchLyrics(fileId = state.activeId) {
+  if (!fileId) return;
+  if (!state.settings.enableLyricsLookup) { toast('Enable Lyrics Lookup in Settings first.', 'error'); return; }
+  const info = lyricsInfo(fileId); info.status = 'searching'; info.lastError = null;
+  if (state.activeId === fileId) renderLyrics(getRecord(fileId));
+  try {
+    const result = await unwrap(await window.musicApp.lyrics.search({ fileId, metadata: metadataFor(fileId) }));
+    applyLyricsLookupResult(fileId, result);
+    log(`Lyrics lookup for ${getRecord(fileId)?.absolutePath?.split(/[\\/]/).pop()}: ${result.status}.`);
+  } catch (error) {
+    info.status = 'failed'; info.lastError = { code: error.code, message: error.message };
+    issue(`${getRecord(fileId)?.absolutePath}: ${error.message}`, error.code); toast(error.message, 'error');
+    if (state.activeId === fileId) renderLyrics(getRecord(fileId));
+  }
+}
+
+async function startLyricsBatch(fileIds) {
+  if (!state.settings.enableLyricsLookup || !fileIds.length) return;
+  if (state.matchReview?.job && ['queued', 'running'].includes(state.matchReview.job.state)) {
+    fileIds.forEach((fileId) => queuedLyricsIds.add(fileId));
+    log(`Queued LRCLIB lookup for ${fileIds.length} reviewed track(s) until Auto Match finishes.`);
+    return;
+  }
+  const items = fileIds.map((fileId) => ({ fileId, metadata: metadataFor(fileId) }));
+  for (const fileId of fileIds) { const info = lyricsInfo(fileId); info.status = 'searching'; info.lastError = null; }
+  const job = await guarded(async () => unwrap(await window.musicApp.lyrics.startBatch(items)), `Starting LRCLIB lookup for ${fileIds.length} reviewed track(s)…`);
+  if (job) { state.currentJob = job; updateJob(job); }
+}
+
+function syncLyricsJob(job) {
+  for (const [fileId, result] of Object.entries(job.results || {})) {
+    const key = `${job.id}:${fileId}`;
+    if (reportedLyricsResults.has(key)) continue;
+    reportedLyricsResults.add(key); applyLyricsLookupResult(fileId, result, { automatic: true });
+  }
+  for (const [fileId, status] of Object.entries(job.itemStatuses || {})) {
+    if (status !== 'cancelled' || !getRecord(fileId)) continue;
+    const info = lyricsInfo(fileId); info.status = 'cancelled'; info.reason = 'Lyrics lookup was cancelled; no pending lyrics were changed.';
+  }
+  for (const error of job.errors || []) {
+    const record = state.records.find((item) => item.absolutePath === error.path || item.fileId === error.path);
+    if (!record) continue;
+    const info = lyricsInfo(record.fileId); info.status = 'failed'; info.lastError = error;
+  }
+  if (state.activeId && getRecord(state.activeId)) renderLyrics(getRecord(state.activeId));
+}
 
 async function importSelection(type) {
   const result = await guarded(async () => unwrap(await (type === 'files' ? window.musicApp.library.pickFiles() : window.musicApp.library.pickFolder())));
@@ -375,6 +599,13 @@ async function previewSave(forceBatch = false) {
     const message = `Preview & Save supports at most ${MAX_BATCH_SAVE_TRACKS} tracks at a time. ${targets.fileIds.length} are currently selected.`;
     issue(message, 'BATCH_SAVE_LIMIT'); toast(message, 'error'); return;
   }
+  for (const fileId of targets.fileIds) {
+    const check = validateLrc(metadataFor(fileId).syncedLyrics || '');
+    if (!check.valid) {
+      const message = `${getRecord(fileId)?.absolutePath?.split(/[\\/]/).pop() || fileId}: fix invalid LRC timestamps before Preview & Save.`;
+      issue(message, 'LRC_INVALID'); toast(message, 'error'); return;
+    }
+  }
   previewPending = true;
   renderSummary();
   try {
@@ -401,33 +632,38 @@ function updateJob(job) {
   const wasSaving = state.isSaving;
   if (job.type === 'batch-save') state.isSaving = ['queued', 'running'].includes(job.state);
   state.currentJob = job; $('#jobBadge').textContent = job.state === 'running' ? '(1)' : '(0)';
-  const matching = job.type === 'metadata-match';
-  $('#savedLabel').textContent = matching ? 'Matched' : 'Saved';
-  $('#skippedLabel').textContent = matching ? 'No Match' : 'Skipped';
-  $('#conflictLabel').textContent = matching ? 'Cancelled' : 'Conflict';
+  const matching = job.type === 'metadata-match'; const lyricsLookup = job.type === 'lyrics-lookup'; const lookup = matching || lyricsLookup;
+  $('#savedLabel').textContent = lookup ? 'Matched' : 'Saved';
+  $('#skippedLabel').textContent = lookup ? 'Not Found' : 'Skipped';
+  $('#conflictLabel').textContent = lookup ? 'Cancelled' : 'Conflict';
   $('#jobTitle').textContent = job.state === 'running' || job.state === 'queued'
-    ? matching ? 'Searching metadata…' : job.type === 'batch-save' ? 'Saving metadata…' : 'Working…'
+    ? matching ? 'Searching metadata…' : lyricsLookup ? 'Searching lyrics…' : job.type === 'batch-save' ? 'Saving metadata…' : 'Working…'
     : job.state[0].toUpperCase() + job.state.slice(1);
   $('#jobBadge').textContent = ['queued', 'running'].includes(job.state) ? '(1)' : '(0)';
   $('#jobProgress').value = job.percent || 0; $('#jobProgressText').textContent = `Processed ${job.processed} / ${job.total} (${job.percent || 0}%)`;
   $('#jobCurrent').textContent = job.currentFile ? `Current file: ${job.currentFile}` : job.state === 'completed' ? 'Operation finished.' : 'No active file.';
   const elapsed = Math.max(0, Math.round(((job.finishedAt || Date.now()) - job.startedAt) / 1000)); $('#jobTiming').textContent = `Elapsed: ${Math.floor(elapsed / 60)}:${String(elapsed % 60).padStart(2, '0')}`;
-  $('#savedCount').textContent = matching ? job.matched || 0 : job.saved;
-  $('#skippedCount').textContent = matching ? job.noMatch || 0 : job.skipped;
-  $('#failedCount').textContent = job.failed; $('#jobConflictCount').textContent = matching ? job.cancelled || 0 : job.conflict;
+  $('#savedCount').textContent = lookup ? job.matched || 0 : job.saved;
+  $('#skippedCount').textContent = lookup ? job.noMatch || 0 : job.skipped;
+  $('#failedCount').textContent = job.failed; $('#jobConflictCount').textContent = lookup ? job.cancelled || 0 : job.conflict;
   $('#cancelJob').disabled = !['queued', 'running'].includes(job.state);
   if (matching) syncMatchJob(job);
+  else if (lyricsLookup) syncLyricsJob(job);
   else syncPreviewSaveJob(job);
   if (job.state === 'completed' || job.state === 'canceled') {
-    log(matching
-      ? `Auto Match ${job.state}: ${job.matched || 0} matched, ${job.noMatch || 0} without a match, ${job.failed || 0} failed, ${job.cancelled || 0} cancelled.`
+    log(lookup
+      ? `${matching ? 'Auto Match' : 'Lyrics lookup'} ${job.state}: ${job.matched || 0} matched, ${job.noMatch || 0} without a match, ${job.failed || 0} failed, ${job.cancelled || 0} cancelled.`
       : `Batch ${job.state}: ${job.saved} saved, ${job.failed} failed, ${job.conflict} conflict.`);
-    if (!matching && !reportedJobCompletions.has(job.id)) {
+    if (!lookup && !reportedJobCompletions.has(job.id)) {
       reportedJobCompletions.add(job.id);
       const incomplete = job.skipped > 0 || job.failed > 0 || job.conflict > 0 || job.state === 'canceled';
       const message = `Batch ${job.state}: ${job.saved} saved, ${job.skipped} skipped, ${job.failed} failed, ${job.conflict} conflict.`;
       toast(message, incomplete ? 'error' : 'success');
     }
+  }
+  if (matching && ['completed', 'canceled'].includes(job.state) && queuedLyricsIds.size) {
+    const ids = [...queuedLyricsIds].filter((fileId) => getRecord(fileId)); queuedLyricsIds.clear();
+    queueMicrotask(() => startLyricsBatch(ids));
   }
   if (job.state === 'completed' || job.state === 'canceled') {
     for (const error of job.errors || []) {
@@ -470,6 +706,7 @@ function createMatchReview(fileIds) {
 
 async function openMatchReview() {
   if (!validateMatchSelection()) return;
+  setMatchDialogMode('metadata');
   const selected = [...state.selectedIds];
   const current = state.matchReview;
   const sameSelection = current && current.fileIds.length === selected.length && current.fileIds.every((id) => state.selectedIds.has(id));
@@ -679,21 +916,37 @@ async function applySelection(fileId, selection) {
 }
 
 async function applyMatch() {
+  if (lyricsReviewMode) {
+    const candidate = lyricsReviewSelections.get(lyricsReviewActiveId);
+    if (!candidate || !lyricsReviewActiveId) return;
+    applyLyricsCandidate(lyricsReviewActiveId, candidate, { reviewed: true });
+    $('#matchDialog').close(); toast('Reviewed LRCLIB lyrics staged. Preview & Save remains required.'); return;
+  }
   const review = state.matchReview; const fileId = review?.activeFileId; const selection = review?.selections.get(fileId);
   if (!fileId || !selection) return;
   if (!await applySelection(fileId, selection)) return;
+  if (state.settings.enableLyricsLookup) await startLyricsBatch([fileId]);
   if (state.activeId === fileId) fillEditor(getRecord(fileId));
   renderSummary(); renderMatchReview(); toast('Reviewed metadata applied to this track draft.');
 }
 
 async function applyReviewedMatches() {
+  if (lyricsReviewMode) {
+    let applied = 0;
+    for (const fileId of lyricsReviewFileIds()) {
+      const candidate = lyricsReviewSelections.get(fileId); if (!candidate) continue;
+      applyLyricsCandidate(fileId, candidate, { reviewed: true }); applied += 1;
+    }
+    $('#matchDialog').close(); toast(`Applied ${applied} reviewed lyrics match(es) to drafts.`, applied ? 'success' : 'error'); return;
+  }
   const review = state.matchReview; if (!review?.selections.size) return;
   $('#applyReviewedMatches').disabled = true;
-  let applied = 0;
-  for (const [fileId, selection] of review.selections) if (await applySelection(fileId, selection)) applied += 1;
+  let applied = 0; const reviewedIds = [];
+  for (const [fileId, selection] of review.selections) if (await applySelection(fileId, selection)) { applied += 1; reviewedIds.push(fileId); }
   if (state.activeId && getRecord(state.activeId)) fillEditor(getRecord(state.activeId));
   renderSummary(); renderMatchReview();
   toast(`Applied ${applied} reviewed match(es) to drafts. Preview & Save remains required.`, applied ? 'success' : 'error');
+  if (reviewedIds.length && state.settings.enableLyricsLookup) await startLyricsBatch(reviewedIds);
 }
 
 async function fingerprintMatch() {
@@ -795,11 +1048,14 @@ function resetTransientControls() {
 
 function clearSessionDisplay() {
   for (const record of state.records) state.hiddenRecordIds.add(record.fileId);
-  state.records = []; state.selectedIds.clear(); state.activeId = null; state.drafts.clear(); state.artworkOperations.clear();
+  state.records = []; state.selectedIds.clear(); state.activeId = null; state.drafts.clear(); state.artworkOperations.clear(); state.lyricsById.clear();
   state.batchArtworkOperation = null; state.search = ''; state.listFilter = ''; state.statusFilter = 'all'; state.sort = { ...DEFAULT_SORT };
   state.currentPage = 1; state.pageSize = DEFAULT_PAGE_SIZE;
   state.issues = []; state.currentPreview = null; state.selectedCandidate = null;
   state.matchReview = null;
+  reportedLyricsResults.clear();
+  queuedLyricsIds.clear();
+  lyricsReviewSelections.clear(); lyricsReviewActiveId = null; lyricsReviewMode = false;
   if (!['queued', 'running'].includes(state.currentJob?.state)) state.currentJob = null;
   selectedMatch = null; currentRenamePreview = null; previewAction = null; previewJobId = null; previewItemStatuses = new Map();
   resetTransientControls(); resetJobDisplay(); clearLogDisplay(); renderIssues(); renderSortHeaders(); renderSummary();
@@ -856,7 +1112,11 @@ function bindEvents() {
   });
   $('#themeButton').addEventListener('click', () => applyTheme(state.settings.theme === 'light' ? 'dark' : 'light'));
   $('#outputFolderButton').addEventListener('click', chooseOutputFolder);
-  $('#settingsButton').addEventListener('click', () => { $('#recursiveSetting').checked = state.settings.recursiveImport; $('#acoustIdKey').value = ''; $('#discogsToken').value = ''; $('#fpcalcPath').value = state.settings.fpcalcPath || ''; $('#settingsDialog').showModal(); });
+  $('#settingsButton').addEventListener('click', () => {
+    $('#recursiveSetting').checked = state.settings.recursiveImport; $('#acoustIdKey').value = ''; $('#discogsToken').value = ''; $('#fpcalcPath').value = state.settings.fpcalcPath || '';
+    for (const name of ['enableLyricsLookup', 'preferSyncedLyrics', 'preserveExistingLyrics', 'exportLrcSidecar', 'requireLyricsReview']) $(`#${name}`).checked = state.settings[name] !== false;
+    $('#settingsDialog').showModal();
+  });
   $('#saveSettings').addEventListener('click', saveSettings); $('#saveButton').addEventListener('click', () => previewSave());
   $('#artworkButton').addEventListener('click', () => state.selectedIds.size > 1 ? stageBatchArtwork() : stageArtwork()); $('#replaceArtwork').addEventListener('click', stageArtwork); $('#replaceArtworkLarge').addEventListener('click', stageArtwork); $('#removeArtwork').addEventListener('click', removeArtwork); $('#removeArtworkLarge').addEventListener('click', removeArtwork);
   $('#batchButton').addEventListener('click', () => { $('#batchPanel').open = true; $('#batchPanel').scrollIntoView({ block: 'nearest' }); });
@@ -865,7 +1125,24 @@ function bindEvents() {
   $('#previewBatch').addEventListener('click', () => previewSave(true)); $('#confirmSave').addEventListener('click', confirmPreview);
   $('#cancelJob').addEventListener('click', async () => { if (state.currentJob) await guarded(async () => unwrap(await window.musicApp.jobs.cancel(state.currentJob.id))); });
   $('#matchButton').addEventListener('click', openMatchReview); $('#searchMatches').addEventListener('click', searchMatches); $('#fingerprintMatch').addEventListener('click', fingerprintMatch); $('#applyMatch').addEventListener('click', applyMatch); $('#applyReviewedMatches').addEventListener('click', applyReviewedMatches);
+  $('#searchLyrics').addEventListener('click', () => searchLyrics());
+  $('#reviewLyrics').addEventListener('click', openLyricsReview);
+  $('#keepExistingLyrics').addEventListener('click', () => {
+    if (!state.activeId) return; const record = getRecord(state.activeId);
+    setDraftField(state.activeId, 'lyrics', record.metadata?.lyrics || ''); setDraftField(state.activeId, 'syncedLyrics', record.metadata?.syncedLyrics || '');
+    const info = lyricsInfo(state.activeId); info.status = 'found'; info.source = 'Embedded'; info.reason = 'Existing embedded lyrics will be kept.'; info.reviewing = false;
+    fillEditor(record); toast('Existing embedded lyrics kept.');
+  });
+  $('#clearLyrics').addEventListener('click', () => {
+    if (!state.activeId) return; const metadata = metadataFor(state.activeId);
+    if ((metadata.lyrics || metadata.syncedLyrics) && !window.confirm('Clear both Plain and Synced lyrics from the pending output copy?')) return;
+    setDraftField(state.activeId, 'lyrics', ''); setDraftField(state.activeId, 'syncedLyrics', '');
+    const info = lyricsInfo(state.activeId); info.status = 'found'; info.source = 'Manual'; info.reason = 'Lyrics removal is staged for the Output copy.'; info.reviewing = false;
+    fillEditor(getRecord(state.activeId));
+  });
+  $$('.lyrics-kind').forEach((button) => button.addEventListener('click', () => selectLyricsKind(button.dataset.lyricsKind)));
   $$('.match-sort').forEach((button) => button.addEventListener('click', () => {
+    if (lyricsReviewMode) { renderLyricsMatchReview(); return; }
     const column = button.dataset.matchSort;
     matchSort = { column, direction: matchSort.column === column && matchSort.direction === 'desc' ? 'asc' : 'desc' };
     for (const item of $$('.match-sort')) {
@@ -876,7 +1153,8 @@ function bindEvents() {
     renderCandidates();
   }));
   $('#matchDialog').addEventListener('close', () => {
-    if (state.matchReview?.job && ['queued', 'running'].includes(state.matchReview.job.state)) log('Metadata Match Review closed; Auto Match continues in Jobs and can be cancelled there.');
+    if (!lyricsReviewMode && state.matchReview?.job && ['queued', 'running'].includes(state.matchReview.job.state)) log('Metadata Match Review closed; Auto Match continues in Jobs and can be cancelled there.');
+    if (lyricsReviewMode) { setMatchDialogMode('metadata'); if (state.matchReview) renderMatchReview(); }
   });
   $('#renameButton').addEventListener('click', () => $('#renameDialog').showModal()); $('#generateRename').addEventListener('click', generateRename); $('#applyRename').addEventListener('click', applyRename);
   $('#revealButton').addEventListener('click', () => state.activeId && window.musicApp.system.openPath(state.activeId));
@@ -893,6 +1171,10 @@ function bindEvents() {
     const input = event.target.closest('[name]'); if (!input || !state.activeId) return;
     const field = input.dataset.mirror || input.name.replace(/_copy$/, ''); setDraftField(state.activeId, field, fromField(field, input.value));
     for (const mirror of $$(`[data-mirror="${field}"], [name="${field}"]`)) if (mirror !== input) mirror.value = input.value;
+    if (field === 'lyrics' || field === 'syncedLyrics') {
+      const info = lyricsInfo(state.activeId); info.source = 'Manual'; info.status = 'found'; info.reason = 'Manually edited; pending Preview & Save.';
+      renderLyrics(getRecord(state.activeId));
+    }
     renderSummary();
   });
   setupSplitter();
@@ -900,6 +1182,7 @@ function bindEvents() {
 
 async function saveSettings() {
   const patch = { recursiveImport: $('#recursiveSetting').checked, fpcalcPath: $('#fpcalcPath').value };
+  for (const name of ['enableLyricsLookup', 'preferSyncedLyrics', 'preserveExistingLyrics', 'exportLrcSidecar', 'requireLyricsReview']) patch[name] = $(`#${name}`).checked;
   if ($('#acoustIdKey').value) patch.acoustIdApiKey = $('#acoustIdKey').value;
   if ($('#discogsToken').value) patch.discogsToken = $('#discogsToken').value;
   const settings = await guarded(async () => unwrap(await window.musicApp.settings.set(patch))); if (!settings) return;

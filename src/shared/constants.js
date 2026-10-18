@@ -7,13 +7,14 @@ const AUDIO_EXTENSIONS = Object.freeze([
 const WRITABLE_FIELDS = Object.freeze([
   'title', 'artist', 'album', 'albumArtist', 'genre', 'date',
   'trackNumber', 'trackTotal', 'discNumber', 'discTotal',
-  'composer', 'comment', 'lyrics', 'musicBrainzRecordingId',
+  'composer', 'comment', 'lyrics', 'syncedLyrics', 'musicBrainzRecordingId',
   'musicBrainzReleaseId', 'musicBrainzArtistId'
 ]);
 
 const BATCH_OPERATIONS = Object.freeze(['KEEP', 'REPLACE', 'CLEAR']);
 const MAX_ARTWORK_BYTES = 15 * 1024 * 1024;
 const MAX_TEXT_LENGTH = 10000;
+const MAX_LYRICS_LENGTH = 200000;
 const MAX_AUTO_MATCH_TRACKS = 50;
 const MAX_BATCH_SAVE_TRACKS = 50;
 const AUTO_MATCH_CONCURRENCY = 3;
@@ -26,5 +27,6 @@ module.exports = {
   MAX_TEXT_LENGTH,
   MAX_AUTO_MATCH_TRACKS,
   MAX_BATCH_SAVE_TRACKS,
-  AUTO_MATCH_CONCURRENCY
+  AUTO_MATCH_CONCURRENCY,
+  MAX_LYRICS_LENGTH
 };

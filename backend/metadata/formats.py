@@ -6,6 +6,7 @@ import base64
 import errno
 import hashlib
 import os
+import re
 import shutil
 import stat
 import struct
@@ -38,7 +39,7 @@ VORBIS_KEYS = {
     "title": "title", "artist": "artist", "album": "album", "albumArtist": "albumartist",
     "genre": "genre", "date": "date", "trackNumber": "tracknumber", "trackTotal": "tracktotal",
     "discNumber": "discnumber", "discTotal": "disctotal", "composer": "composer", "comment": "comment",
-    "lyrics": "lyrics", "musicBrainzRecordingId": "musicbrainz_trackid",
+    "lyrics": "lyrics", "syncedLyrics": "syncedlyrics", "musicBrainzRecordingId": "musicbrainz_trackid",
     "musicBrainzReleaseId": "musicbrainz_albumid", "musicBrainzArtistId": "musicbrainz_artistid",
 }
 ID3_TEXT = {
@@ -87,6 +88,31 @@ def text_list(value: Any) -> list[str]:
 def scalar(value: Any) -> str:
     values = text_list(value)
     return values[0] if values else ""
+
+
+LRC_TIMESTAMP = re.compile(r"\[(\d{1,3}):(\d{2})(?:[.:](\d{1,3}))?\]")
+LRC_METADATA_TAG = re.compile(r"^\[(?:ar|al|ti|au|by|length|offset|re):", re.IGNORECASE)
+
+
+def is_synced_lyrics(value: Any) -> bool:
+    """Return whether text contains at least one valid LRC line timestamp."""
+    for match in LRC_TIMESTAMP.finditer(str(value or "")):
+        if int(match.group(2)) < 60:
+            return True
+    return False
+
+
+def split_lyrics_values(values: Any) -> tuple[str, str]:
+    """Select one plain and one raw LRC value without converting either one."""
+    plain = ""
+    synced = ""
+    for value in text_list(values):
+        if is_synced_lyrics(value):
+            if not synced:
+                synced = value
+        elif not plain:
+            plain = value
+    return plain, synced
 
 
 def file_signature(path: str) -> dict[str, Any]:
@@ -138,6 +164,14 @@ def read_vorbis(tags: Any) -> dict[str, Any]:
         result["trackNumber"], result["trackTotal"] = split_pair(tags.get("tracknumber"))
     if not result["discTotal"]:
         result["discNumber"], result["discTotal"] = split_pair(tags.get("discnumber"))
+    # Navidrome scans LYRICS/UNSYNCEDLYRICS and parses LRC timestamps itself.
+    # Keep the editor's two values independent while accepting older files that
+    # used only SYNCEDLYRICS.
+    plain, compatible_synced = split_lyrics_values(tags.get("lyrics", []))
+    alternate_plain, _ = split_lyrics_values(tags.get("unsyncedlyrics", []))
+    _ignored_plain, legacy_synced = split_lyrics_values(tags.get("syncedlyrics", []))
+    result["lyrics"] = alternate_plain or plain
+    result["syncedLyrics"] = compatible_synced or legacy_synced
     return result
 
 
@@ -152,9 +186,20 @@ def read_id3(tags: Any) -> dict[str, Any]:
     comments = tags.getall("COMM")
     lyrics = tags.getall("USLT")
     primary_comment = next((frame for frame in comments if frame.lang == "eng" and not frame.desc), comments[0] if comments else None)
-    primary_lyrics = next((frame for frame in lyrics if frame.lang == "eng" and not frame.desc), lyrics[0] if lyrics else None)
     result["comment"] = scalar(primary_comment) if primary_comment else ""
-    result["lyrics"] = getattr(primary_lyrics, "text", "") if primary_lyrics else ""
+    primary_plain = next((frame for frame in lyrics if not is_synced_lyrics(getattr(frame, "text", "")) and frame.lang == "eng" and not frame.desc), None)
+    if primary_plain is None:
+        primary_plain = next((frame for frame in lyrics if not is_synced_lyrics(getattr(frame, "text", ""))), None)
+    primary_lrc = next((frame for frame in lyrics if is_synced_lyrics(getattr(frame, "text", ""))), None)
+    result["lyrics"] = getattr(primary_plain, "text", "") if primary_plain else ""
+    result["syncedLyrics"] = getattr(primary_lrc, "text", "") if primary_lrc else ""
+    synced = tags.getall("SYLT")
+    primary_synced = next((frame for frame in synced if frame.lang == "eng" and not frame.desc), synced[0] if synced else None)
+    if primary_synced and not result["syncedLyrics"]:
+        result["syncedLyrics"] = "\n".join(
+            f"[{milliseconds // 60000:02d}:{(milliseconds % 60000) / 1000:06.3f}]{line}"
+            for line, milliseconds in primary_synced.text
+        )
     for frame in tags.getall("TXXX"):
         key = frame.desc.lower()
         if key == "musicbrainz album id": result["musicBrainzReleaseId"] = scalar(frame)
@@ -177,6 +222,10 @@ def read_mp4(tags: Any) -> dict[str, Any]:
         value = tags.get(key, [])
         if key.startswith("----"):
             result[field] = decode_mp4_freeform(value)
+        elif field == "lyrics":
+            plain, synced = split_lyrics_values(value)
+            result["lyrics"] = plain
+            result["syncedLyrics"] = synced
         else:
             values = text_list(value)
             result[field] = values if field in ARRAY_FIELDS else (values[0] if values else "")
@@ -185,6 +234,30 @@ def read_mp4(tags: Any) -> dict[str, Any]:
     result["trackNumber"], result["trackTotal"] = str(track[0] or ""), str(track[1] or "")
     result["discNumber"], result["discTotal"] = str(disc[0] or ""), str(disc[1] or "")
     return result
+
+
+def validate_lrc(value: str) -> int:
+    """Validate timestamps without rewriting user-provided LRC text."""
+    previous = -1.0
+    timed_lines = 0
+    for line_number, line in enumerate(str(value).splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or LRC_METADATA_TAG.match(stripped):
+            continue
+        matches = list(LRC_TIMESTAMP.finditer(line))
+        if not matches:
+            raise MetadataError("LRC_INVALID", f"Synced lyrics line {line_number} has no valid timestamp.")
+        timed_lines += 1
+        for match in matches:
+            seconds = int(match.group(1)) * 60 + int(match.group(2)) + float(f"0.{match.group(3) or '0'}")
+            if int(match.group(2)) >= 60:
+                raise MetadataError("LRC_INVALID", f"Synced lyrics line {line_number} has an invalid timestamp.")
+            if seconds < previous:
+                raise MetadataError("LRC_INVALID", f"Synced lyrics line {line_number} is earlier than the previous timestamp.")
+            previous = seconds
+    if str(value).strip() and not timed_lines:
+        raise MetadataError("LRC_INVALID", "Synced lyrics do not contain a timestamped line.")
+    return timed_lines
 
 
 def image_dimensions(data: bytes) -> tuple[Optional[int], Optional[int]]:
@@ -276,7 +349,21 @@ def set_or_delete(tags: Any, key: str, value: Any) -> None:
 
 def write_vorbis(audio: Any, patch: dict[str, Any]) -> None:
     if audio.tags is None: audio.add_tags()
+    if "lyrics" in patch or "syncedLyrics" in patch:
+        existing = read_vorbis(audio.tags)
+        plain = patch.get("lyrics", existing.get("lyrics", ""))
+        synced = patch.get("syncedLyrics", existing.get("syncedLyrics", ""))
+        # Navidrome's scanner recognizes LYRICS and UNSYNCEDLYRICS, then parses
+        # raw LRC in those values. Put synced first in LYRICS so clients that
+        # choose the first structured entry prefer the timed version.
+        set_or_delete(audio.tags, "lyrics", synced or plain)
+        set_or_delete(audio.tags, "unsyncedlyrics", plain if synced and plain else "")
+        # Retain the conventional field for non-Navidrome readers. Navidrome's
+        # current mapping ignores it, so LYRICS above is the compatibility key.
+        set_or_delete(audio.tags, "syncedlyrics", synced)
     for field, value in patch.items():
+        if field in {"lyrics", "syncedLyrics"}:
+            continue
         if field in VORBIS_KEYS: set_or_delete(audio.tags, VORBIS_KEYS[field], value)
 
 
@@ -284,6 +371,20 @@ def write_id3(audio: Any, patch: dict[str, Any]) -> None:
     from mutagen.id3 import Frames
     if audio.tags is None: audio.add_tags()
     tags = audio.tags
+    if "lyrics" in patch or "syncedLyrics" in patch:
+        existing = read_id3(tags)
+        plain = patch.get("lyrics", existing.get("lyrics", ""))
+        synced = patch.get("syncedLyrics", existing.get("syncedLyrics", ""))
+        for frame in list(tags.getall("USLT")):
+            if frame.lang == "eng" and frame.desc in {"", "synced", "unsynced"}:
+                tags.delall(frame.HashKey)
+        # Raw LRC in USLT is deliberate: Navidrome maps USLT to its canonical
+        # lyrics property and parses the timestamps. SYLT is preserved but not
+        # authored because it cannot round-trip the original LRC text exactly.
+        if synced:
+            tags.add(USLT(encoding=3, lang="eng", desc="", text=str(synced)))
+        if plain:
+            tags.add(USLT(encoding=3, lang="eng", desc="unsynced" if synced else "", text=str(plain)))
     for field, value in patch.items():
         if field in ID3_TEXT:
             tags.delall(ID3_TEXT[field])
@@ -304,10 +405,8 @@ def write_id3(audio: Any, patch: dict[str, Any]) -> None:
             for frame in list(tags.getall("COMM")):
                 if frame.lang == "eng" and not frame.desc: tags.delall(frame.HashKey)
             if value not in (None, ""): tags.add(COMM(encoding=3, lang="eng", desc="", text=[str(value)]))
-        elif field == "lyrics":
-            for frame in list(tags.getall("USLT")):
-                if frame.lang == "eng" and not frame.desc: tags.delall(frame.HashKey)
-            if value not in (None, ""): tags.add(USLT(encoding=3, lang="eng", desc="", text=str(value)))
+        elif field in {"lyrics", "syncedLyrics"}:
+            continue
         elif field == "musicBrainzRecordingId":
             for frame in list(tags.getall("UFID")):
                 if frame.owner == "http://musicbrainz.org": tags.delall(frame.HashKey)
@@ -322,7 +421,16 @@ def write_id3(audio: Any, patch: dict[str, Any]) -> None:
 def write_mp4(audio: Any, patch: dict[str, Any]) -> None:
     if audio.tags is None: audio.add_tags()
     tags = audio.tags
+    if "lyrics" in patch or "syncedLyrics" in patch:
+        existing = read_mp4(tags)
+        plain = patch.get("lyrics", existing.get("lyrics", ""))
+        synced = patch.get("syncedLyrics", existing.get("syncedLyrics", ""))
+        values = [str(value) for value in (synced, plain) if value]
+        if values: tags["\xa9lyr"] = values
+        else: tags.pop("\xa9lyr", None)
     for field, value in patch.items():
+        if field in {"lyrics", "syncedLyrics"}:
+            continue
         if field in MP4_KEYS:
             key = MP4_KEYS[field]
             if value in (None, "", []): tags.pop(key, None)
@@ -441,6 +549,8 @@ def _verify_flac_preservation(
         for field in patch
         if field in VORBIS_KEYS
     }
+    if "lyrics" in patch or "syncedLyrics" in patch:
+        changed_keys.update({"lyrics", "unsyncedlyrics", "syncedlyrics"})
     for key, values in before_tags.items():
         if key not in changed_keys and after_tags.get(key) != values:
             raise MetadataError("VERIFY_FAILED", f"An untouched FLAC metadata field changed: {key}")
@@ -472,6 +582,7 @@ def write_metadata(
     output_path: str,
     patch: dict[str, Any],
     artwork_operation: Optional[dict[str, Any]] = None,
+    export_lrc_sidecar: bool = False,
 ) -> dict[str, Any]:
     """Copy a source, patch the copy, verify it, and publish only to Output."""
     require_mutagen()
@@ -503,12 +614,23 @@ def write_metadata(
     family = original["format"]
     if family not in {"FLAC", "MP3", "M4A", "OGG", "OPUS", "AIFF"}:
         raise MetadataError("READ_ONLY", f"{family} is read-only in this application.")
+    synced_value = patch.get("syncedLyrics") if "syncedLyrics" in patch else None
+    sidecar_required = bool(synced_value) and export_lrc_sidecar
+    sidecar_path = os.path.splitext(destination)[0] + ".lrc" if sidecar_required else None
+    if sidecar_path and os.path.lexists(sidecar_path):
+        raise MetadataError("OUTPUT_EXISTS", "The Output LRC sidecar already exists and was not overwritten.")
+    if synced_value:
+        validate_lrc(str(synced_value))
+    embedded_patch = dict(patch)
+    verification_patch = embedded_patch
     try:
         before = integrity_snapshot(real_path, family, original)
     except IntegrityError as exc:
         raise MetadataError("INTEGRITY_CHECK_UNAVAILABLE", f"Could not isolate the original audio payload: {exc}") from exc
 
     temporary_path = None
+    sidecar_temporary_path = None
+    audio_published = False
     try:
         descriptor, temporary_path = tempfile.mkstemp(
             prefix=f".{Path(real_path).name}.metadata-", suffix=Path(real_path).suffix,
@@ -522,12 +644,12 @@ def write_metadata(
             if exc.errno == errno.ENOSPC:
                 raise MetadataError("OUTPUT_NO_SPACE", "There is not enough free space in the Output Folder.") from exc
             raise MetadataError("COPY_FAILED", f"Could not copy the source file to Output: {exc}") from exc
-        _write_metadata_in_place(temporary_path, patch, artwork_operation)
+        _write_metadata_in_place(temporary_path, embedded_patch, artwork_operation)
         candidate = read_metadata(temporary_path, include_artwork=True)
-        _verify_written_fields(candidate, patch)
+        _verify_written_fields(candidate, verification_patch)
         _verify_written_artwork(candidate, artwork_operation)
         if family == "FLAC":
-            _verify_flac_preservation(real_path, temporary_path, patch, artwork_operation)
+            _verify_flac_preservation(real_path, temporary_path, embedded_patch, artwork_operation)
         try:
             after = integrity_snapshot(temporary_path, family, candidate)
             assert_integrity(before, after)
@@ -541,8 +663,28 @@ def write_metadata(
         current_identity = (current_stat.st_dev, current_stat.st_ino, current_stat.st_size, current_stat.st_mtime_ns)
         if current_identity != original_identity:
             raise MetadataError("FILE_CHANGED", "The file changed while metadata was being prepared. Re-read it before saving.")
+        if sidecar_path:
+            descriptor, sidecar_temporary_path = tempfile.mkstemp(
+                prefix=f".{Path(sidecar_path).name}.lyrics-", suffix=".lrc", dir=output_parent,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as sidecar_file:
+                sidecar_file.write(str(synced_value))
+                sidecar_file.flush()
+                os.fsync(sidecar_file.fileno())
+            if Path(sidecar_temporary_path).read_text(encoding="utf-8") != str(synced_value):
+                raise MetadataError("VERIFY_FAILED", "The LRC sidecar did not read back correctly.")
         _publish_without_overwrite(temporary_path, destination)
         temporary_path = None
+        audio_published = True
+        if sidecar_path:
+            try:
+                _publish_without_overwrite(sidecar_temporary_path, sidecar_path)
+                sidecar_temporary_path = None
+            except Exception:
+                try: os.unlink(destination)
+                except OSError: pass
+                audio_published = False
+                raise
         try:
             directory_fd = os.open(output_parent, os.O_RDONLY)
             try: os.fsync(directory_fd)
@@ -551,6 +693,7 @@ def write_metadata(
             pass  # Directory fsync is unavailable on some supported platforms.
         candidate["absolutePath"] = destination
         candidate.update(file_signature(destination))
+        candidate["lyricsSidecarPath"] = sidecar_path
         return candidate
     except MetadataError:
         raise
@@ -561,6 +704,12 @@ def write_metadata(
         if temporary_path:
             try: os.unlink(temporary_path)
             except FileNotFoundError: pass
+        if sidecar_temporary_path:
+            try: os.unlink(sidecar_temporary_path)
+            except FileNotFoundError: pass
+        if audio_published and sidecar_path and not os.path.exists(sidecar_path):
+            try: os.unlink(destination)
+            except OSError: pass
 
 
 def staged_artwork(path: str) -> dict[str, Any]:

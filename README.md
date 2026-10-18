@@ -18,6 +18,14 @@ A local-first Electron desktop utility for reviewing and editing audio metadata.
 - Choosing **Apply Current to Draft** or **Apply Reviewed to Draft** updates in-memory drafts only. It never writes an audio file. Use **Preview & Save** and a safe Output Folder to create verified copies.
 - MusicBrainz, iTunes, and Deezer metadata search work without credentials. Discogs is reported as unavailable until a token is saved in Settings. AcoustID remains an explicit fingerprint action and requires its own key plus Chromaprint.
 
+## Lyrics (LRCLIB)
+
+- The Lyrics tab sits between Artwork and Technical. It reads embedded Plain/Synced lyrics, keeps edits as per-file drafts, validates LRC timestamps without rewriting them, and searches LRCLIB manually or after reviewed metadata is applied.
+- Lookup uses precise `/api/get`, structured `/api/search`, then keyword/filename fallbacks. Ambiguous versions, close scores, and filename guesses require review; existing lyrics are preserved by default.
+- Plain and Synced lyrics remain separate drafts and round-trip independently. For Navidrome compatibility, raw timestamped LRC is embedded in the field its scanner actually reads: `USLT` for MP3/AIFF, `LYRICS` for FLAC/Ogg/Opus, and `©lyr` for M4A/MP4. When both forms exist, the synced value is stored first and the plain value uses a second `USLT`, `UNSYNCEDLYRICS`, or `©lyr` value. Vorbis-family files also retain `SYNCEDLYRICS` as a compatibility mirror for other readers.
+- **Export External LRC** is an optional Settings choice. It writes a UTF-8 `.lrc` beside the new Output copy with the exact same basename, never beside the source and never over an existing sidecar. Current Navidrome versions prefer sidecars by default through `LyricsPriority`; set the priority deliberately if embedded and external lyrics differ.
+- LRCLIB lookup is read-only. It is serialized with a delay, honors `Retry-After`, supports cancellation, and never publishes lyrics back to the service. Lyrics may be copyrighted; users are responsible for lawful use.
+
 ### Chromaprint / fingerprint matching
 
 Chromaprint creates the fingerprint locally; AcoustID uses that fingerprint to

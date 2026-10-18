@@ -1,6 +1,6 @@
 'use strict';
 
-const { BATCH_OPERATIONS, MAX_AUTO_MATCH_TRACKS, MAX_BATCH_SAVE_TRACKS, MAX_TEXT_LENGTH, WRITABLE_FIELDS } = require('./constants');
+const { BATCH_OPERATIONS, MAX_AUTO_MATCH_TRACKS, MAX_BATCH_SAVE_TRACKS, MAX_LYRICS_LENGTH, MAX_TEXT_LENGTH, WRITABLE_FIELDS } = require('./constants');
 
 class AppError extends Error {
   constructor(code, message, details) {
@@ -81,7 +81,7 @@ function metadataPatch(value) {
         ? raw.map((item) => string(item, field, { max: 1000 })).filter(Boolean)
         : [string(raw, field, { max: 1000 })].filter(Boolean);
     } else {
-      patch[field] = string(String(raw), field);
+      patch[field] = string(String(raw), field, { max: ['lyrics', 'syncedLyrics'].includes(field) ? MAX_LYRICS_LENGTH : MAX_TEXT_LENGTH });
     }
   }
   return patch;

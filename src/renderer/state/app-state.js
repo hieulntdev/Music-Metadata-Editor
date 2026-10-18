@@ -11,6 +11,7 @@ export const state = {
   activeId: null,
   drafts: new Map(),
   artworkOperations: new Map(),
+  lyricsById: new Map(),
   batchArtworkOperation: null,
   search: '',
   listFilter: '',
@@ -18,7 +19,10 @@ export const state = {
   sort: { ...DEFAULT_SORT },
   currentPage: 1,
   pageSize: DEFAULT_PAGE_SIZE,
-  settings: { theme: 'light', recursiveImport: true, panelRatio: 0.65, fpcalcPath: '' },
+  settings: {
+    theme: 'light', recursiveImport: true, panelRatio: 0.65, fpcalcPath: '', enableLyricsLookup: true,
+    preferSyncedLyrics: true, preserveExistingLyrics: true, exportLrcSidecar: false, requireLyricsReview: true
+  },
   outputFolder: '',
   currentJob: null,
   issues: [],
@@ -122,5 +126,6 @@ export function replaceRecord(record, clearDraft = true, reveal = true) {
   if (clearDraft) {
     state.drafts.delete(record.fileId);
     state.artworkOperations.delete(record.fileId);
+    state.lyricsById.delete(record.fileId);
   }
 }

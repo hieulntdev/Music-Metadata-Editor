@@ -45,6 +45,10 @@ contextBridge.exposeInMainWorld('musicApp', Object.freeze({
     fingerprint: (fileId) => invoke('match:fingerprint', { fileId }),
     coverUrl: (releaseId) => invoke('match:cover-url', { releaseId })
   }),
+  lyrics: Object.freeze({
+    search: (request) => invoke('lyrics:search', request),
+    startBatch: (items) => invoke('lyrics:batch-start', { items })
+  }),
   jobs: Object.freeze({
     cancel: (jobId) => invoke('jobs:cancel', { jobId }),
     onProgress: (handler) => subscribe('jobs:progress', handler)

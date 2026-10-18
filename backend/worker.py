@@ -23,10 +23,10 @@ from typing import Any, Optional
 
 from metadata.formats import (
     MetadataError, SUPPORTED_EXTENSIONS, file_signature, read_metadata,
-    staged_artwork, write_metadata,
+    staged_artwork, write_metadata, validate_lrc,
 )
 
-WORKER_VERSION = "1.0.0"
+WORKER_VERSION = "1.1.0"
 DB_PATH = os.environ.get("MUSIC_METADATA_DB")
 db: Optional[sqlite3.Connection] = None
 
@@ -221,14 +221,35 @@ def save(payload: dict[str, Any]) -> dict[str, Any]:
         current = file_signature(path)
         if current["fileSize"] != expected.get("fileSize") or current["modifiedTimeNs"] != str(expected.get("modifiedTimeNs")):
             raise MetadataError("FILE_CHANGED", "The file changed while the save was being prepared. Re-read it before saving.")
-        record = write_metadata(path, output_path, patch, artwork_operation)
+        plain = patch.get("lyrics") if "lyrics" in patch else None
+        synced = patch.get("syncedLyrics") if "syncedLyrics" in patch else None
+        synced_lines = 0
+        if synced:
+            synced_lines = validate_lrc(str(synced))
+        if "lyrics" in patch or "syncedLyrics" in patch:
+            diagnostic("[Lyrics] Source: editor/LRCLIB draft")
+            diagnostic(f"[Lyrics] Plain: {'Available' if plain else 'Empty' if plain == '' else 'Unchanged'}")
+            diagnostic(f"[Lyrics] Synced: {'Available' if synced else 'Empty' if synced == '' else 'Unchanged'}")
+            diagnostic(f"[Lyrics] Synced lines: {synced_lines}")
+        record = write_metadata(path, output_path, patch, artwork_operation, bool(payload.get("exportLrcSidecar")))
         record["fileId"] = stable_id(output_path)
+        if "lyrics" in patch or "syncedLyrics" in patch:
+            family = record.get("format", "UNKNOWN")
+            fields = {"FLAC": "LYRICS/UNSYNCEDLYRICS (+SYNCEDLYRICS compatibility)", "OGG": "LYRICS/UNSYNCEDLYRICS (+SYNCEDLYRICS compatibility)", "OPUS": "LYRICS/UNSYNCEDLYRICS (+SYNCEDLYRICS compatibility)", "MP3": "USLT", "AIFF": "USLT", "M4A": "©lyr"}
+            diagnostic(f"[Lyrics] Output format: {family}")
+            diagnostic(f"[Lyrics] Embedded field/frame: {fields.get(family, 'Unsupported')}")
         for field, expected_value in patch.items():
             if record["metadata"].get(field) != expected_value:
                 raise MetadataError("VERIFY_FAILED", f"Saved field did not read back correctly: {field}")
+        if "lyrics" in patch or "syncedLyrics" in patch:
+            diagnostic("[Lyrics] Embedded write: Success")
+            diagnostic("[Lyrics] Read-back verification: Passed")
+            diagnostic(f"[Lyrics] External LRC: {'Written and verified' if record.get('lyricsSidecarPath') else 'Not requested'}")
         audit("save", path, list(patch), "saved")
-        return {"record": record, "outputPath": output_path}
+        return {"record": record, "outputPath": output_path, "sidecarPath": record.get("lyricsSidecarPath")}
     except Exception as exc:
+        if "lyrics" in patch or "syncedLyrics" in patch:
+            diagnostic(f"[Lyrics] Save/read-back verification: Failed ({getattr(exc, 'code', 'WRITE_FAILED')})")
         audit("save", path, list(patch), "failed", getattr(exc, "code", "WRITE_FAILED"))
         raise
 

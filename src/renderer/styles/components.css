@@ -96,6 +96,27 @@ body.resizing-column, body.resizing-column * { cursor: col-resize !important; us
 .artwork-preview img, .large-artwork img { width: 100%; height: 100%; object-fit: cover; }
 .artwork-actions { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-2); }
 .large-artwork { max-width: 252px; align-self: center; }
+.lyrics-page { min-height: 0; }
+.lyrics-information { display: flex; flex-direction: column; gap: var(--space-2); padding: var(--space-3); border: 1px solid var(--border-primary); border-radius: var(--radius-control); background: var(--bg-wash); }
+.lyrics-status { color: var(--text-muted); font-size: var(--font-size-caption); }
+.lyrics-status.found, .lyrics-status.saved, .lyrics-status.instrumental { color: var(--status-success); }
+.lyrics-status.reviewRequired { color: var(--status-warning); }
+.lyrics-status.failed { color: var(--status-danger); }
+.lyrics-facts { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: var(--space-1) var(--space-3); margin: 0; }
+.lyrics-facts dt { color: var(--text-muted); font-size: var(--font-size-caption); font-weight: 600; }
+.lyrics-facts dd { margin: 0; min-width: 0; overflow-wrap: anywhere; }
+.lyrics-actions .button { flex: 1 1 auto; padding-inline: var(--space-2); }
+.lyrics-content { min-height: 0; display: flex; flex-direction: column; border: 1px solid var(--border-primary); border-radius: var(--radius-control); overflow: hidden; }
+.lyrics-kind-tabs { display: grid; grid-template-columns: 1fr 1fr; flex: 0 0 var(--height-compact); border-bottom: 1px solid var(--border-primary); background: var(--bg-surface); }
+.lyrics-kind { border: 0; background: transparent; color: var(--text-secondary); position: relative; }
+.lyrics-kind + .lyrics-kind { border-left: 1px solid var(--border-primary); }
+.lyrics-kind.selected { color: var(--accent-outline); background: var(--bg-wash); }
+.lyrics-editor { display: none; min-height: 0; padding: var(--space-2); }
+.lyrics-editor.selected { display: flex; }
+.lyrics-editor textarea { height: 220px; min-height: 126px; max-height: 360px; resize: vertical; overflow: auto; font-family: var(--font-mono); line-height: 1.45; white-space: pre-wrap; }
+#lrcValidation.invalid { color: var(--status-danger); }
+.settings-scroll { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: var(--space-3); padding: 2px; }
+.settings-group { display: flex; flex-direction: column; gap: var(--space-1); padding: var(--space-3); border: 1px solid var(--border-primary); border-radius: var(--radius-control); }
 .subsection-header { justify-content: space-between; }
 .subsection-header h2 { margin: 0; font-size: var(--font-size-control); font-weight: 600; }
 .batch-panel { border: 1px solid var(--border-primary); border-radius: var(--radius-panel); overflow: hidden; }
@@ -177,6 +198,9 @@ progress::-moz-progress-bar { background: var(--accent); border-radius: var(--ra
 .match-result-panel { display: grid; grid-template-rows: minmax(156px, 1fr) minmax(100px, auto); gap: var(--space-3); overflow: hidden; }
 .candidate-table { min-width: 0; min-height: 0; overflow: auto; border: 1px solid var(--border-primary); border-radius: var(--radius-control); }
 .candidate-header, .candidate { min-width: 720px; display: grid; grid-template-columns: 40px minmax(132px, 1.2fr) minmax(112px, 1fr) minmax(132px, 1.2fr) 72px minmax(116px, .9fr); }
+.candidate-header .lyrics-only { display: none; }
+.candidate-table.lyrics-review .candidate-header, .candidate-table.lyrics-review .candidate { min-width: 940px; grid-template-columns: 40px minmax(132px, 1.2fr) minmax(112px, 1fr) minmax(132px, 1.2fr) 76px 92px 64px 84px; }
+.candidate-table.lyrics-review .candidate-header .lyrics-only { display: flex; }
 .candidate-header { position: sticky; top: 0; z-index: 1; height: var(--height-table-row); background: var(--bg-surface); border-bottom: 1px solid var(--border-primary); }
 .candidate-header > span, .candidate-header > button, .candidate > span { min-width: 0; padding: 0 var(--space-3); display: flex; align-items: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; border-right: 1px solid var(--border-primary); background: transparent; }
 .candidate-header > :last-child, .candidate > :last-child { border-right: 0; }
@@ -196,6 +220,7 @@ progress::-moz-progress-bar { background: var(--accent); border-radius: var(--ra
 .comparison-row:last-child { border-bottom: 0; }
 .comparison-row span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comparison-row .current-value { color: var(--text-muted); }
+.lyrics-review-preview { margin: 0; padding: var(--space-3); min-height: 100%; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono); font-size: var(--font-size-caption); line-height: 1.45; }
 .rename-row { display: grid; grid-template-columns: 1fr 22px 1fr; gap: var(--space-2); padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--border-primary); }
 .rename-row.conflict { color: var(--status-danger); }
 .rename-row span { overflow-wrap: anywhere; }
