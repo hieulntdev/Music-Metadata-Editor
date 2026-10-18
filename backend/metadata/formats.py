@@ -568,5 +568,6 @@ def staged_artwork(path: str) -> dict[str, Any]:
     width, height = image_dimensions(data)
     return {
         "mime": mime, "bytesSize": len(data), "dimensions": [width, height],
+        "imageHash": hashlib.sha256(data).hexdigest(),
         "previewDataUrl": f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}",
     }

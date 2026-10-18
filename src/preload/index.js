@@ -23,6 +23,7 @@ contextBridge.exposeInMainWorld('musicApp', Object.freeze({
   }),
   metadata: Object.freeze({
     get: (fileId) => invoke('metadata:get', { fileId }),
+    markReviewed: (fileId) => invoke('metadata:mark-reviewed', { fileId }),
     preview: (request) => invoke('metadata:preview', request),
     save: (previewId) => invoke('metadata:save', { previewId })
   }),

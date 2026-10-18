@@ -17,6 +17,7 @@ class PythonBridge extends EventEmitter {
     this.process = null;
     this.ready = false;
     this.stopping = false;
+    this.stopPromise = null;
   }
 
   static candidates(appRoot) {
@@ -50,7 +51,8 @@ class PythonBridge extends EventEmitter {
       cwd: this.appRoot,
       windowsHide: true,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, MUSIC_METADATA_DB: this.databasePath }
+      env: { ...process.env, MUSIC_METADATA_DB: this.databasePath },
+      detached: process.platform !== 'win32'
     });
     this.process.stderr.setEncoding('utf8');
     this.process.stderr.on('data', (chunk) => this.emit('diagnostic', chunk.trim()));
@@ -61,8 +63,8 @@ class PythonBridge extends EventEmitter {
       if (!this.stopping) this.failAll('WORKER_UNAVAILABLE', `Metadata worker stopped (${signal || code}).`);
     });
 
-    const lines = readline.createInterface({ input: this.process.stdout, crlfDelay: Infinity });
-    lines.on('line', (line) => this.handleLine(line));
+    this.lines = readline.createInterface({ input: this.process.stdout, crlfDelay: Infinity });
+    this.lines.on('line', (line) => this.handleLine(line));
     const result = await this.request('ping', {}, 10000, true);
     if (!result?.workerVersion) throw Object.assign(new Error('Metadata worker handshake failed.'), { code: 'WORKER_UNAVAILABLE' });
     this.ready = true;
@@ -87,8 +89,8 @@ class PythonBridge extends EventEmitter {
     else pending.reject(Object.assign(new Error(message.error?.message || 'Worker request failed.'), message.error || {}));
   }
 
-  request(action, payload = {}, timeout = this.timeout, allowStarting = false) {
-    if (!this.process || (!this.ready && !allowStarting)) {
+  request(action, payload = {}, timeout = this.timeout, allowStarting = false, allowStopping = false) {
+    if (!this.process || (!this.ready && !allowStarting) || (this.stopping && !allowStopping)) {
       return Promise.reject(Object.assign(new Error('Metadata worker is unavailable.'), { code: 'WORKER_UNAVAILABLE' }));
     }
     const requestId = `req-${Date.now()}-${++this.sequence}`;
@@ -115,13 +117,46 @@ class PythonBridge extends EventEmitter {
     this.pending.clear();
   }
 
-  async stop() {
-    this.stopping = true;
-    if (!this.process) return;
-    try { await this.request('shutdown', {}, 1000); } catch { /* process may already be gone */ }
-    if (this.process) this.process.kill();
-    this.process = null;
-    this.ready = false;
+  signalProcessTree(child, signal) {
+    if (!child || child.exitCode !== null || child.signalCode) return;
+    try {
+      if (process.platform !== 'win32' && child.pid) process.kill(-child.pid, signal);
+      else if (signal === 'SIGKILL' && child.pid) {
+        spawnSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], { windowsHide: true, timeout: 3000 });
+      } else child.kill(signal);
+    } catch { /* The owned worker may already have exited. */ }
+  }
+
+  waitForExit(child, timeout) {
+    if (!child || child.exitCode !== null || child.signalCode) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => { cleanup(); resolve(false); }, timeout);
+      const onExit = () => { cleanup(); resolve(true); };
+      const cleanup = () => { clearTimeout(timer); child.removeListener('exit', onExit); };
+      child.once('exit', onExit);
+    });
+  }
+
+  stop({ gracefulTimeout = 3000, forceTimeout = 1500 } = {}) {
+    if (this.stopPromise) return this.stopPromise;
+    this.stopPromise = (async () => {
+      this.stopping = true;
+      const child = this.process;
+      if (!child) { this.ready = false; return; }
+      try { await this.request('shutdown', {}, gracefulTimeout, true, true); } catch { /* Fall through to owned-process termination. */ }
+      if (!await this.waitForExit(child, 250)) {
+        this.signalProcessTree(child, 'SIGTERM');
+        if (!await this.waitForExit(child, forceTimeout)) {
+          this.signalProcessTree(child, 'SIGKILL');
+          await this.waitForExit(child, 500);
+        }
+      }
+      this.lines?.close();
+      this.failAll('WORKER_STOPPED', 'Metadata worker stopped during application shutdown.');
+      if (this.process === child) this.process = null;
+      this.ready = false;
+    })();
+    return this.stopPromise;
   }
 }
 

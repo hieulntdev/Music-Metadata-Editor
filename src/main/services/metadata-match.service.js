@@ -2,6 +2,7 @@
 
 const { setTimeout: delay } = require('node:timers/promises');
 const { similarity } = require('./musicbrainz.service');
+const { parseFilename } = require('./filename-query');
 
 function cleanString(value) {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
@@ -248,6 +249,7 @@ class MetadataMatchService {
       new DeezerProvider(),
       new DiscogsProvider(this.getSettings)
     ];
+    this.searchCache = new Map();
   }
 
   providerStatuses() {
@@ -265,12 +267,38 @@ class MetadataMatchService {
 
   async searchTrack(record, { signal } = {}) {
     const trackId = String(record?.fileId || '');
+    const metadataTitle = cleanString(record?.metadata?.title);
+    const filenameFallback = metadataTitle ? null : parseFilename(record?.absolutePath);
+    const plans = metadataTitle
+      ? [{ record, metadata: record?.metadata || {} }]
+      : filenameFallback.queries.map((metadata) => ({ record: { ...record, metadata }, metadata }));
     const available = this.providers.filter((provider) => provider.isAvailable().available);
     const settled = await Promise.allSettled(available.map(async (provider) => {
-      const raw = await provider.searchTrack(record, { signal });
+      const raw = [];
+      let successfulQuery = false;
+      let lastError;
+      for (const plan of plans) {
+        try {
+          const cacheKey = `${provider.providerId}:${comparable(plan.metadata.title)}:${comparable(artists(plan.metadata.artist).join(' '))}:${comparable(plan.metadata.album)}`;
+          const cached = this.searchCache.get(cacheKey);
+          let values;
+          if (cached && Date.now() - cached.time < 10 * 60 * 1000) values = cached.value;
+          else {
+            values = await provider.searchTrack(plan.record, { signal });
+            this.searchCache.set(cacheKey, { time: Date.now(), value: values });
+            if (this.searchCache.size > 300) this.searchCache.delete(this.searchCache.keys().next().value);
+          }
+          successfulQuery = true;
+          raw.push(...values);
+        } catch (error) {
+          if (signal?.aborted) throw error;
+          lastError = error;
+        }
+      }
+      if (!successfulQuery && lastError) throw lastError;
       return raw.map((item) => {
         const candidate = provider.normalizeResult(item, trackId);
-        candidate.matchScore = calculateMatchScore(record, candidate);
+        candidate.matchScore = plans.reduce((best, plan) => Math.max(best, calculateMatchScore(plan.record, candidate)), 0);
         return candidate;
       });
     }));
@@ -286,11 +314,45 @@ class MetadataMatchService {
         message: result.reason?.message || `${available[index].displayName} failed.`
       });
     });
-    return { fileId: trackId, candidates: mergeCandidates(candidates), providerErrors, providerCount: available.length };
+    return {
+      fileId: trackId,
+      candidates: mergeCandidates(candidates),
+      providerErrors,
+      providerCount: available.length,
+      matchBasis: filenameFallback ? 'filename' : 'metadata',
+      filenameFallback: filenameFallback ? {
+        filename: filenameFallback.filename,
+        album: filenameFallback.album,
+        composer: filenameFallback.composer,
+        featuring: filenameFallback.featuring,
+        version: filenameFallback.version,
+        queries: filenameFallback.queries
+      } : null
+    };
   }
+}
+
+function classifyMatchResult(result) {
+  const candidates = Array.isArray(result?.candidates) ? result.candidates : [];
+  const providerErrors = Array.isArray(result?.providerErrors) ? result.providerErrors : [];
+  const providerCount = Math.max(0, Number(result?.providerCount) || 0);
+  const allProvidersFailed = providerCount > 0 && providerErrors.length >= providerCount;
+  const matchStatus = candidates.length ? 'matched' : allProvidersFailed ? 'failed' : 'no-match';
+  const matchError = providerErrors.length ? {
+    code: allProvidersFailed ? 'MATCH_PROVIDERS_FAILED' : 'MATCH_PROVIDER_PARTIAL_FAILURE',
+    message: allProvidersFailed
+      ? 'Every available metadata provider failed for this track.'
+      : 'One or more metadata providers failed while matching this track.',
+    details: providerErrors
+  } : null;
+  return {
+    jobStatus: matchStatus === 'no-match' ? 'noMatch' : matchStatus,
+    matchStatus,
+    matchError
+  };
 }
 
 module.exports = {
   MetadataMatchService, MusicBrainzProvider, ITunesProvider, DeezerProvider, DiscogsProvider,
-  normalizeCandidate, calculateMatchScore, mergeCandidates
+  normalizeCandidate, calculateMatchScore, mergeCandidates, classifyMatchResult
 };

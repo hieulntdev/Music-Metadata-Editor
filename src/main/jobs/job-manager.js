@@ -7,9 +7,12 @@ class JobManager extends EventEmitter {
   constructor() {
     super();
     this.jobs = new Map();
+    this.activeRuns = new Set();
+    this.shuttingDown = false;
   }
 
   create(type, items, processor, options = {}) {
+    if (this.shuttingDown) throw Object.assign(new Error('The application is shutting down and cannot start another job.'), { code: 'APP_SHUTTING_DOWN' });
     const id = crypto.randomUUID();
     const concurrency = Math.max(1, Math.min(8, Number(options.concurrency) || 1));
     const itemStatuses = Object.fromEntries(items.map((item, index) => [this.itemKey(item, index), 'pending']));
@@ -18,11 +21,16 @@ class JobManager extends EventEmitter {
       saved: 0, skipped: 0, failed: 0, conflict: 0,
       matched: 0, noMatch: 0, cancelled: 0,
       currentFile: '', cancelRequested: false, errors: [], results: {}, itemStatuses,
-      concurrency, startedAt: Date.now(), _controller: new AbortController()
+      concurrency, startedAt: Date.now(), _controller: new AbortController(),
+      _inProgressStatus: options.inProgressStatus || 'processing'
     };
     Object.assign(job, options.publicData || {});
     this.jobs.set(id, job);
-    queueMicrotask(() => this.run(job, items, processor));
+    queueMicrotask(() => {
+      const run = this.run(job, items, processor);
+      this.activeRuns.add(run);
+      run.finally(() => this.activeRuns.delete(run));
+    });
     return this.public(job);
   }
 
@@ -39,7 +47,7 @@ class JobManager extends EventEmitter {
         const key = this.itemKey(item, index);
         const currentFile = item.path || item.absolutePath || item.fileId || String(key);
         job.currentFile = currentFile;
-        job.itemStatuses[key] = 'searching';
+        job.itemStatuses[key] = job._inProgressStatus;
         this.emitUpdate(job);
         try {
           const result = await processor(item, job, { signal: job._controller.signal, index, key });
@@ -91,12 +99,38 @@ class JobManager extends EventEmitter {
     return true;
   }
 
+  cancelAll() {
+    this.shuttingDown = true;
+    let canceled = 0;
+    for (const job of this.jobs.values()) {
+      if (job.state === 'queued' || job.state === 'running') {
+        this.cancel(job.id);
+        canceled += 1;
+      }
+    }
+    return canceled;
+  }
+
+  hasActiveType(type) {
+    return [...this.jobs.values()].some((job) => job.type === type && (job.state === 'queued' || job.state === 'running'));
+  }
+
+  async waitForIdle(timeout = 3000) {
+    if (!this.activeRuns.size) return true;
+    let timer;
+    const timedOut = new Promise((resolve) => { timer = setTimeout(() => resolve(false), timeout); });
+    const settled = Promise.allSettled([...this.activeRuns]).then(() => true);
+    const result = await Promise.race([settled, timedOut]);
+    clearTimeout(timer);
+    return result;
+  }
+
   emitUpdate(job) { this.emit('progress', this.public(job)); }
 
   itemKey(item, index) { return String(item?.fileId || item?.id || index); }
 
   public(job) {
-    const { _controller, ...safe } = job;
+    const { _controller, _inProgressStatus, ...safe } = job;
     return {
       ...safe,
       errors: job.errors.slice(-100),

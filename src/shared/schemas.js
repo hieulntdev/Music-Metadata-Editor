@@ -1,6 +1,6 @@
 'use strict';
 
-const { BATCH_OPERATIONS, MAX_AUTO_MATCH_TRACKS, MAX_TEXT_LENGTH, WRITABLE_FIELDS } = require('./constants');
+const { BATCH_OPERATIONS, MAX_AUTO_MATCH_TRACKS, MAX_BATCH_SAVE_TRACKS, MAX_TEXT_LENGTH, WRITABLE_FIELDS } = require('./constants');
 
 class AppError extends Error {
   constructor(code, message, details) {
@@ -43,6 +43,28 @@ function autoMatchFileIds(value) {
     throw new AppError('AUTO_MATCH_LIMIT', `Auto Match supports at most ${MAX_AUTO_MATCH_TRACKS} tracks at a time.`);
   }
   return ids;
+}
+
+function batchPreviewItems(value) {
+  if (!Array.isArray(value) || !value.length || value.length > MAX_BATCH_SAVE_TRACKS) {
+    throw new AppError('BATCH_SAVE_LIMIT', `Batch Preview & Save supports 1-${MAX_BATCH_SAVE_TRACKS} tracks.`);
+  }
+  const seen = new Set();
+  return value.map((raw, index) => {
+    const item = object(raw, `items[${index}]`);
+    const fileId = string(item.fileId, `items[${index}].fileId`, { max: 128, allowEmpty: false });
+    if (seen.has(fileId)) throw new AppError('INVALID_SELECTION', 'A track can appear only once in a batch.');
+    seen.add(fileId);
+    let artworkOperation = null;
+    if (item.artworkOperation !== null && item.artworkOperation !== undefined) {
+      const artwork = object(item.artworkOperation, `items[${index}].artworkOperation`);
+      if (!['replace', 'remove'].includes(artwork.mode)) throw new AppError('INVALID_REQUEST', 'Invalid artwork operation.');
+      artworkOperation = artwork.mode === 'replace'
+        ? { mode: 'replace', token: string(artwork.token, 'artwork token', { max: 128, allowEmpty: false }) }
+        : { mode: 'remove' };
+    }
+    return { fileId, patch: metadataPatch(item.patch || {}), artworkOperation };
+  });
 }
 
 function metadataPatch(value) {
@@ -88,4 +110,4 @@ function publicError(error) {
   };
 }
 
-module.exports = { AppError, object, string, stringArray, fileIds, autoMatchFileIds, metadataPatch, batchOperations, publicError };
+module.exports = { AppError, object, string, stringArray, fileIds, autoMatchFileIds, batchPreviewItems, metadataPatch, batchOperations, publicError };

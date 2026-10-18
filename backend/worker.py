@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import hashlib
+import atexit
 import json
 import os
 import socket
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -27,6 +29,23 @@ from metadata.formats import (
 WORKER_VERSION = "1.0.0"
 DB_PATH = os.environ.get("MUSIC_METADATA_DB")
 db: Optional[sqlite3.Connection] = None
+
+
+def cleanup() -> None:
+    global db
+    if db is not None:
+        db.close()
+        db = None
+
+
+def handle_termination(_signum: int, _frame: Any) -> None:
+    cleanup()
+    raise SystemExit(0)
+
+
+atexit.register(cleanup)
+for termination_signal in (signal.SIGINT, signal.SIGTERM):
+    signal.signal(termination_signal, handle_termination)
 
 
 def respond(message: dict[str, Any]) -> None:
@@ -458,7 +477,7 @@ def main() -> None:
             else:
                 diagnostic("Unexpected worker error:\n" + traceback.format_exc())
             respond({"requestId": request_id, "ok": False, "error": error_object(exc)})
-    if db is not None: db.close()
+    cleanup()
 
 
 def _mutagen_available() -> bool:

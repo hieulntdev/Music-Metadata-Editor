@@ -1,4 +1,5 @@
-import { DEFAULT_SORT, state, filteredRecords, getRecord, isDirty, metadataFor, replaceRecord, setDraftField } from '../state/app-state.js';
+import { DEFAULT_PAGE_SIZE, DEFAULT_SORT, state, filteredRecords, getRecord, hasArtworkChange, isDirty, metadataFor, pagedRecords, paginationFor, replaceRecord, saveSelection, setDraftField, setStatusFilter } from '../state/app-state.js';
+import { recordMatchesStatusFilter, recordStatus } from '../state/record-status.mjs';
 import { MusicTable } from './music-table.js';
 
 const $ = (selector) => document.querySelector(selector);
@@ -10,9 +11,15 @@ let previewAction = null;
 let logRows = 0;
 const reportedJobErrors = new Set();
 const reportedJobOutputs = new Set();
+const reportedJobCompletions = new Set();
 const reportedProviderErrors = new Set();
 const MAX_AUTO_MATCH_TRACKS = 50;
+const MAX_BATCH_SAVE_TRACKS = 50;
 let matchSort = { column: 'matchScore', direction: 'desc' };
+let previewPending = false;
+let controlsLocked = false;
+let previewJobId = null;
+let previewItemStatuses = new Map();
 
 function unwrap(response) {
   if (response?.ok) return response.result;
@@ -89,21 +96,46 @@ async function guarded(action, pendingMessage) {
 }
 
 function renderSummary() {
-  const dirty = state.records.filter((record) => isDirty(record.fileId)).length;
-  const conflicts = state.records.filter((record) => record.status?.conflict).length;
-  const errors = state.records.filter((record) => record.status?.readError || record.status?.saveError).length + state.issues.length;
-  $('#allCount').textContent = `(${state.records.length.toLocaleString()})`; $('#dirtyCount').textContent = `(${dirty})`;
-  $('#conflictCount').textContent = `(${conflicts})`; $('#errorCount').textContent = `(${errors})`;
+  const statuses = state.records.map((record) => ({ record, status: recordStatus(record, isDirty(record.fileId)) }));
+  const done = statuses.filter((item) => item.status.done).length;
+  const incomplete = statuses.length - done;
+  const dirty = statuses.filter((item) => !item.status.done && item.status.dirty).length;
+  const conflicts = statuses.filter((item) => !item.status.done && item.status.conflict).length;
+  const errors = statuses.filter((item) => !item.status.done && item.status.error).length;
+  $('#allCount').textContent = `(${incomplete.toLocaleString()})`; $('#dirtyCount').textContent = `(${dirty})`;
+  $('#conflictCount').textContent = `(${conflicts})`; $('#errorCount').textContent = `(${errors})`; $('#doneCount').textContent = `(${done})`;
   $('#batchSelection').textContent = `(${state.selectedIds.size} tracks selected)`;
   $('#matchButtonLabel').textContent = `Auto Match (${state.selectedIds.size})`;
   $('#batchButton').disabled = state.selectedIds.size < 2; $('#matchButton').disabled = state.selectedIds.size < 1;
-  $('#artworkButton').disabled = !state.activeId; $('#saveButton').disabled = !state.activeId || !isDirty(state.activeId);
-  $('#previewBatch').disabled = state.selectedIds.size < 2; $('#renameButton').disabled = state.selectedIds.size < 1;
+  const saveTargets = saveSelection();
+  const saveUnavailable = controlsLocked || previewPending || state.isSaving;
+  $('#artworkButton').disabled = !state.activeId; $('#saveButton').disabled = saveUnavailable || !saveTargets.hasChanges;
+  $('#previewBatch').disabled = saveUnavailable || state.selectedIds.size < 2; $('#renameButton').disabled = state.selectedIds.size < 1;
   const visible = filteredRecords();
-  const selectedVisible = visible.filter((record) => state.selectedIds.has(record.fileId)).length;
-  $('#selectAll').checked = visible.length > 0 && selectedVisible === visible.length;
-  $('#selectAll').indeterminate = selectedVisible > 0 && selectedVisible < visible.length;
+  const visiblePage = pagedRecords(visible).records;
+  const selectedVisible = visiblePage.filter((record) => state.selectedIds.has(record.fileId)).length;
+  $('#selectAll').checked = visiblePage.length > 0 && selectedVisible === visiblePage.length;
+  $('#selectAll').indeterminate = selectedVisible > 0 && selectedVisible < visiblePage.length;
+  renderPagination(visible);
   table.render();
+}
+
+function renderPagination(records = filteredRecords()) {
+  const page = paginationFor(records);
+  const first = page.itemCount ? page.startIndex + 1 : 0;
+  $('#paginationSummary').textContent = `Showing ${first}–${page.endIndex} of ${page.itemCount.toLocaleString()}`;
+  $('#paginationPage').textContent = `Page ${page.currentPage} of ${page.totalPages}`;
+  $('#pageSize').value = String(page.pageSize);
+  $('#firstPage').disabled = page.currentPage <= 1;
+  $('#previousPage').disabled = page.currentPage <= 1;
+  $('#nextPage').disabled = page.currentPage >= page.totalPages;
+  $('#lastPage').disabled = page.currentPage >= page.totalPages;
+}
+
+function goToPage(page) {
+  state.currentPage = page;
+  table.viewport.scrollTop = 0;
+  renderSummary();
 }
 
 function selectionChanged() { renderSummary(); }
@@ -168,14 +200,19 @@ async function importSelection(type) {
   setLocked(false);
   if (!scan) return;
   for (const record of scan.records) replaceRecord(record);
+  state.sort = { ...DEFAULT_SORT }; state.currentPage = 1; state.pageSize = DEFAULT_PAGE_SIZE;
+  renderSortHeaders();
   for (const error of scan.errors) issue(`${error.path}: ${error.error.message}`, error.error.code);
   log(`Scan complete: ${scan.records.length} read, ${scan.errors.length} failed.`, scan.errors.length ? 'error' : '');
   toast(`Imported ${scan.records.length} track${scan.records.length === 1 ? '' : 's'}.`, 'success'); renderSummary();
 }
 
 function setLocked(locked) {
-  for (const button of [$('#importFilesButton'), $('#importFolderButton'), $('#saveButton'), $('#previewBatch')]) button.disabled = locked || (button === $('#saveButton') && (!state.activeId || !isDirty(state.activeId)));
+  controlsLocked = locked;
+  $('#importFilesButton').disabled = locked;
+  $('#importFolderButton').disabled = locked;
   document.body.setAttribute('aria-busy', String(locked));
+  renderSummary();
 }
 
 async function stageArtwork() {
@@ -197,50 +234,108 @@ function removeBatchArtwork() {
 
 function removeArtwork() { if (!state.activeId) return; state.artworkOperations.set(state.activeId, { mode: 'remove' }); fillEditor(getRecord(state.activeId)); toast('Artwork removal staged.'); }
 
-async function previewMetadata() {
-  if (!state.activeId) return;
-  if (!requireOutputFolder()) return;
-  const preview = await guarded(async () => unwrap(await window.musicApp.metadata.preview({ fileId: state.activeId, patch: state.drafts.get(state.activeId) || {}, artworkOperation: state.artworkOperations.get(state.activeId) || null })), 'Preparing save preview…');
+async function previewMetadata(fileId) {
+  const preview = await guarded(async () => unwrap(await window.musicApp.metadata.preview({ fileId, patch: state.drafts.get(fileId) || {}, artworkOperation: hasArtworkChange(fileId) ? state.artworkOperations.get(fileId) : null })), 'Preparing save preview…');
   if (!preview) return; showPreview(preview, 'metadata');
 }
 
 function displayValue(value) { if (Array.isArray(value)) return value.join('; ') || '(empty)'; return value === '' || value === null || value === undefined ? '(empty)' : String(value); }
 
-function showPreview(preview, type) {
+const PREVIEW_STATUS_LABELS = Object.freeze({
+  ready: 'Ready', pending: 'Pending', searching: 'Saving…', saving: 'Saving…', saved: 'Saved & verified',
+  unchanged: 'No changes', blocked: 'Conflict', skipped: 'Skipped', failed: 'Failed', conflict: 'Conflict', cancelled: 'Cancelled'
+});
+
+function setPreviewItemStatus(fileId, status, detail = '') {
+  const normalized = status === 'searching' ? 'saving' : status;
+  previewItemStatuses.set(fileId, normalized);
+  const element = document.querySelector(`[data-preview-status="${CSS.escape(fileId)}"]`);
+  if (element) {
+    element.className = `preview-file-status ${normalized}`;
+    element.textContent = PREVIEW_STATUS_LABELS[normalized] || normalized;
+    element.title = detail;
+  }
+}
+
+function renderPreviewProgress(job = null) {
+  const statuses = [...previewItemStatuses.values()];
+  const count = (name) => statuses.filter((status) => status === name).length;
+  const complete = count('saved') + count('skipped') + count('failed') + count('conflict') + count('cancelled');
+  const total = state.currentPreview?.entries?.length || statuses.length;
+  const prefix = job ? `Processed ${job.processed} / ${job.total}` : `${complete} / ${total} processed`;
+  $('#previewProgress').textContent = `${prefix} • ${count('saved')} successful, ${count('failed')} failed, ${count('skipped')} skipped, ${count('conflict') + count('blocked')} conflict, ${count('cancelled')} cancelled`;
+}
+
+export function showPreview(preview, type) {
   state.currentPreview = preview; previewAction = type;
+  previewJobId = null; previewItemStatuses = new Map();
   const list = $('#changeList'); list.replaceChildren();
   const changes = preview.entries.flatMap((entry) => entry.changes.map((change) => ({ ...change, path: entry.path })));
   const warnings = preview.warnings || [];
-  $('#previewSummary').textContent = `${preview.affected ?? preview.entries.filter((entry) => entry.changes.length).length} file(s), ${changes.length} change(s)${preview.conflicts ? `, ${preview.conflicts} conflict(s)` : ''}${warnings.length ? ` • ${warnings.join(' ')}` : ''}.`;
-  for (const change of changes.slice(0, 500)) {
-    const row = document.createElement('div'); row.className = 'change-row';
-    for (const [className, value] of [['', change.field], ['before', displayValue(change.before)], ['', '→'], ['after', displayValue(change.after)]]) {
-      const cell = document.createElement(className ? 'span' : className === '' && value === change.field ? 'strong' : 'span'); cell.className = className; cell.textContent = value; if (value === change.field) cell.title = change.path; row.append(cell);
+  const affected = preview.affected ?? preview.entries.filter((entry) => entry.changes.length).length;
+  $('#previewSummary').textContent = `${preview.entries.length} file(s) selected, ${affected} affected, ${changes.length} change(s)${preview.conflicts ? `, ${preview.conflicts} conflict(s)` : ''}${warnings.length ? ` • ${warnings.join(' ')}` : ''}.`;
+  for (const entry of preview.entries) {
+    const blocked = Boolean(entry.conflict || entry.outputConflict);
+    const initialStatus = !entry.changes.length ? 'unchanged' : blocked ? 'blocked' : 'ready';
+    previewItemStatuses.set(entry.fileId, initialStatus);
+    const group = document.createElement('section'); group.className = 'preview-file';
+    const header = document.createElement('div'); header.className = 'preview-file-header';
+    const name = document.createElement('span'); name.className = 'preview-file-name';
+    name.textContent = entry.path.split(/[\\/]/).pop() || entry.path; name.title = `${entry.path}${entry.outputPath ? ` → ${entry.outputPath}` : ''}`;
+    const status = document.createElement('span'); status.dataset.previewStatus = entry.fileId;
+    status.className = `preview-file-status ${initialStatus}`; status.textContent = PREVIEW_STATUS_LABELS[initialStatus];
+    header.append(name, status); group.append(header);
+    if (entry.changes.length) {
+      const headings = document.createElement('div'); headings.className = 'preview-change-header';
+      for (const label of ['Field', 'Before', 'After']) { const cell = document.createElement('span'); cell.textContent = label; headings.append(cell); }
+      group.append(headings);
+      for (const change of entry.changes) {
+        const row = document.createElement('div'); row.className = 'preview-change-row';
+        for (const [className, value] of [['', change.field], ['before', displayValue(change.before)], ['after', displayValue(change.after)]]) {
+          const cell = document.createElement(className ? 'span' : 'strong'); cell.className = className; cell.textContent = value; cell.title = value; row.append(cell);
+        }
+        group.append(row);
+      }
+    } else {
+      const empty = document.createElement('p'); empty.className = 'preview-file-empty'; empty.textContent = 'No metadata changes; this file will be skipped.'; group.append(empty);
     }
-    list.append(row);
+    list.append(group);
   }
-  if (!changes.length) { const empty = document.createElement('p'); empty.className = 'empty-state'; empty.textContent = 'There are no actual changes to save.'; list.append(empty); }
+  renderPreviewProgress();
   $('#confirmSave').disabled = !changes.length || (type === 'metadata' && (Boolean(preview.conflicts) || warnings.length > 0)); $('#previewDialog').showModal();
 }
 
 async function confirmPreview() {
-  const preview = state.currentPreview; if (!preview) return;
+  const preview = state.currentPreview; if (!preview || state.isSaving) return;
+  state.isSaving = true;
   $('#confirmSave').disabled = true;
-  if (previewAction === 'metadata') {
-    const result = await guarded(async () => unwrap(await window.musicApp.metadata.save(preview.previewId)), 'Saving metadata…');
-    if (result) {
-      if (result.sourceRecord) replaceRecord(result.sourceRecord);
-      $('#previewDialog').close(); log(`Saved and verified Output copy: ${result.outputPath}`); toast('Output copy saved and verified. Source unchanged.', 'success');
-      if (state.activeId) fillEditor(getRecord(state.activeId)); renderSummary();
+  renderSummary();
+  let batchStarted = false;
+  try {
+    if (previewAction === 'metadata') {
+      setPreviewItemStatus(preview.entries[0].fileId, 'saving'); renderPreviewProgress();
+      const result = await guarded(async () => unwrap(await window.musicApp.metadata.save(preview.previewId)), 'Saving metadata…');
+      if (result) {
+        if (result.sourceRecord) replaceRecord(result.sourceRecord);
+        setPreviewItemStatus(preview.entries[0].fileId, result.unchanged ? 'skipped' : 'saved');
+        log(`Saved and verified Output copy: ${result.outputPath}`); toast('Output copy saved and verified. Source unchanged.', 'success');
+        if (state.activeId) fillEditor(getRecord(state.activeId));
+      } else setPreviewItemStatus(preview.entries[0].fileId, 'failed');
+      renderPreviewProgress();
+    } else {
+      const job = await guarded(async () => unwrap(await window.musicApp.batch.save(preview.previewId)), 'Starting batch save…');
+      if (job) {
+        batchStarted = true;
+        previewJobId = job.id;
+        state.currentJob = job; state.batchArtworkOperation = null; $('#batchArtworkStatus').textContent = 'KEEP (no change)';
+        updateJob(job);
+      } else for (const entry of preview.entries) if (previewItemStatuses.get(entry.fileId) === 'ready') setPreviewItemStatus(entry.fileId, 'failed');
     }
-  } else {
-    const job = await guarded(async () => unwrap(await window.musicApp.batch.save(preview.previewId)), 'Starting batch save…');
-    if (job) {
-      state.currentJob = job; state.batchArtworkOperation = null; $('#batchArtworkStatus').textContent = 'KEEP (no change)';
-      $('#previewDialog').close(); updateJob(job);
-    }
+  } finally {
+    if (!batchStarted) state.isSaving = false;
+    $('#confirmSave').disabled = true;
+    renderSummary();
   }
-  $('#confirmSave').disabled = false;
 }
 
 function operations() {
@@ -251,17 +346,60 @@ function operations() {
   return result;
 }
 
-async function previewBatch() {
-  if (!requireOutputFolder()) return;
+function cloneDraft(fileId) {
+  return Object.fromEntries(Object.entries(state.drafts.get(fileId) || {}).map(([field, value]) => [field, Array.isArray(value) ? [...value] : value]));
+}
+
+function batchSnapshot(fileIds) {
+  return fileIds.map((fileId) => ({
+    fileId,
+    patch: cloneDraft(fileId),
+    artworkOperation: hasArtworkChange(fileId) ? { ...state.artworkOperations.get(fileId) } : null
+  }));
+}
+
+async function previewBatch(fileIds = saveSelection().fileIds) {
   const preview = await guarded(async () => unwrap(await window.musicApp.batch.preview({
-    fileIds: [...state.selectedIds], operations: operations(), cleanup: $('#cleanupStrings').checked,
+    items: batchSnapshot(fileIds), operations: operations(), cleanup: $('#cleanupStrings').checked,
     find: $('#findText').value, replace: $('#replaceText').value, sequential: $('#sequentialTracks').checked, startTrack: $('#startTrack').value,
     artworkOperation: state.batchArtworkOperation
   })), 'Preparing batch preview…');
   if (preview) showPreview(preview, 'batch');
 }
 
+async function previewSave(forceBatch = false) {
+  if (previewPending || state.isSaving) return;
+  const targets = saveSelection();
+  if ((!targets.hasChanges && !forceBatch) || !requireOutputFolder()) return;
+  if (targets.fileIds.length > MAX_BATCH_SAVE_TRACKS) {
+    const message = `Preview & Save supports at most ${MAX_BATCH_SAVE_TRACKS} tracks at a time. ${targets.fileIds.length} are currently selected.`;
+    issue(message, 'BATCH_SAVE_LIMIT'); toast(message, 'error'); return;
+  }
+  previewPending = true;
+  renderSummary();
+  try {
+    if (forceBatch || targets.mode === 'batch') await previewBatch(targets.fileIds);
+    else await previewMetadata(targets.fileIds[0]);
+  } finally {
+    previewPending = false;
+    renderSummary();
+  }
+}
+
+function syncPreviewSaveJob(job) {
+  if (job.type !== 'batch-save' || job.id !== previewJobId || !state.currentPreview) return;
+  for (const entry of state.currentPreview.entries) {
+    const status = job.itemStatuses?.[entry.fileId];
+    if (!status) continue;
+    const error = (job.errors || []).find((item) => item.path === entry.path);
+    setPreviewItemStatus(entry.fileId, status, error ? `${error.code}: ${error.message}` : '');
+  }
+  renderPreviewProgress(job);
+}
+
 function updateJob(job) {
+  const wasSaving = state.isSaving;
+  if (job.type === 'batch-save') state.isSaving = ['queued', 'running'].includes(job.state);
   state.currentJob = job; $('#jobBadge').textContent = job.state === 'running' ? '(1)' : '(0)';
   const matching = job.type === 'metadata-match';
   $('#savedLabel').textContent = matching ? 'Matched' : 'Saved';
@@ -279,10 +417,17 @@ function updateJob(job) {
   $('#failedCount').textContent = job.failed; $('#jobConflictCount').textContent = matching ? job.cancelled || 0 : job.conflict;
   $('#cancelJob').disabled = !['queued', 'running'].includes(job.state);
   if (matching) syncMatchJob(job);
+  else syncPreviewSaveJob(job);
   if (job.state === 'completed' || job.state === 'canceled') {
     log(matching
       ? `Auto Match ${job.state}: ${job.matched || 0} matched, ${job.noMatch || 0} without a match, ${job.failed || 0} failed, ${job.cancelled || 0} cancelled.`
       : `Batch ${job.state}: ${job.saved} saved, ${job.failed} failed, ${job.conflict} conflict.`);
+    if (!matching && !reportedJobCompletions.has(job.id)) {
+      reportedJobCompletions.add(job.id);
+      const incomplete = job.skipped > 0 || job.failed > 0 || job.conflict > 0 || job.state === 'canceled';
+      const message = `Batch ${job.state}: ${job.saved} saved, ${job.skipped} skipped, ${job.failed} failed, ${job.conflict} conflict.`;
+      toast(message, incomplete ? 'error' : 'success');
+    }
   }
   if (job.state === 'completed' || job.state === 'canceled') {
     for (const error of job.errors || []) {
@@ -298,6 +443,7 @@ function updateJob(job) {
       log(`Saved and verified Output copy: ${result.outputPath}`);
     }
   }
+  if (wasSaving !== state.isSaving) renderSummary();
 }
 
 function validateMatchSelection() {
@@ -525,13 +671,17 @@ async function applySelection(fileId, selection) {
       if (staged) state.artworkOperations.set(fileId, { mode: 'replace', ...staged });
     }
   }
+  const reviewed = await guarded(async () => unwrap(await window.musicApp.metadata.markReviewed(fileId)));
+  if (!reviewed) return false;
+  replaceRecord(reviewed, false);
   state.matchReview.applied.add(fileId);
+  return true;
 }
 
 async function applyMatch() {
   const review = state.matchReview; const fileId = review?.activeFileId; const selection = review?.selections.get(fileId);
   if (!fileId || !selection) return;
-  await applySelection(fileId, selection);
+  if (!await applySelection(fileId, selection)) return;
   if (state.activeId === fileId) fillEditor(getRecord(fileId));
   renderSummary(); renderMatchReview(); toast('Reviewed metadata applied to this track draft.');
 }
@@ -539,10 +689,11 @@ async function applyMatch() {
 async function applyReviewedMatches() {
   const review = state.matchReview; if (!review?.selections.size) return;
   $('#applyReviewedMatches').disabled = true;
-  for (const [fileId, selection] of review.selections) await applySelection(fileId, selection);
+  let applied = 0;
+  for (const [fileId, selection] of review.selections) if (await applySelection(fileId, selection)) applied += 1;
   if (state.activeId && getRecord(state.activeId)) fillEditor(getRecord(state.activeId));
   renderSummary(); renderMatchReview();
-  toast(`Applied ${review.selections.size} reviewed match(es) to drafts. Preview & Save remains required.`, 'success');
+  toast(`Applied ${applied} reviewed match(es) to drafts. Preview & Save remains required.`, applied ? 'success' : 'error');
 }
 
 async function fingerprintMatch() {
@@ -593,7 +744,8 @@ async function applyRename() {
 async function reloadLibrary() {
   const records = await guarded(async () => unwrap(await window.musicApp.library.list())); if (!records) return;
   state.records = records.filter((record) => !state.hiddenRecordIds.has(record.fileId));
-  state.selectedIds.clear(); state.activeId = null; $('#metadataForm').hidden = true; $('#editorEmpty').hidden = false; $('#technicalSummary').hidden = true; renderSummary();
+  state.selectedIds.clear(); state.activeId = null; state.sort = { ...DEFAULT_SORT }; state.currentPage = 1; state.pageSize = DEFAULT_PAGE_SIZE;
+  $('#metadataForm').hidden = true; $('#editorEmpty').hidden = false; $('#technicalSummary').hidden = true; renderSortHeaders(); renderSummary();
 }
 
 function applyTheme(theme, persist = true) {
@@ -645,10 +797,11 @@ function clearSessionDisplay() {
   for (const record of state.records) state.hiddenRecordIds.add(record.fileId);
   state.records = []; state.selectedIds.clear(); state.activeId = null; state.drafts.clear(); state.artworkOperations.clear();
   state.batchArtworkOperation = null; state.search = ''; state.listFilter = ''; state.statusFilter = 'all'; state.sort = { ...DEFAULT_SORT };
+  state.currentPage = 1; state.pageSize = DEFAULT_PAGE_SIZE;
   state.issues = []; state.currentPreview = null; state.selectedCandidate = null;
   state.matchReview = null;
   if (!['queued', 'running'].includes(state.currentJob?.state)) state.currentJob = null;
-  selectedMatch = null; currentRenamePreview = null; previewAction = null;
+  selectedMatch = null; currentRenamePreview = null; previewAction = null; previewJobId = null; previewItemStatuses = new Map();
   resetTransientControls(); resetJobDisplay(); clearLogDisplay(); renderIssues(); renderSortHeaders(); renderSummary();
   toast('Current session display cleared. Files and saved metadata were not changed.');
 }
@@ -672,24 +825,44 @@ function setupSplitter() {
 function bindEvents() {
   $('#importFilesButton').addEventListener('click', () => importSelection('files')); $('#importFolderButton').addEventListener('click', () => importSelection('folder'));
   $('#clearButton').addEventListener('click', clearSessionDisplay);
-  $('#globalSearch').addEventListener('input', (event) => { state.search = event.target.value; table.render(); }); $('#listFilter').addEventListener('input', (event) => { state.listFilter = event.target.value; table.render(); });
-  $('#filterChips').addEventListener('click', (event) => { const chip = event.target.closest('.chip'); if (!chip) return; $$('.chip').forEach((item) => item.classList.remove('selected')); chip.classList.add('selected'); state.statusFilter = chip.dataset.filter; table.render(); });
+  $('#globalSearch').addEventListener('input', (event) => { state.search = event.target.value; state.currentPage = 1; renderSummary(); }); $('#listFilter').addEventListener('input', (event) => { state.listFilter = event.target.value; state.currentPage = 1; renderSummary(); });
+  $('#filterChips').addEventListener('click', (event) => {
+    const chip = event.target.closest('.chip'); if (!chip) return;
+    $$('.chip').forEach((item) => item.classList.toggle('selected', item === chip));
+    if (setStatusFilter(chip.dataset.filter)) {
+      table.resetSelectionAnchor();
+      $('#metadataForm').hidden = true; $('#editorEmpty').hidden = false; $('#technicalSummary').hidden = true;
+      table.viewport.scrollTop = 0;
+    }
+    renderSummary();
+  });
   $$('.sort-header').forEach((button) => button.addEventListener('click', (event) => {
     if (event.target.closest('.column-resizer')) return;
     const column = button.dataset.sort;
     state.sort = { column, direction: state.sort.column === column && state.sort.direction === 'asc' ? 'desc' : 'asc' };
-    renderSortHeaders(); table.render();
+    state.currentPage = 1; renderSortHeaders(); renderSummary();
   }));
-  $('#selectAll').addEventListener('change', (event) => { filteredRecords().forEach((record) => event.target.checked ? state.selectedIds.add(record.fileId) : state.selectedIds.delete(record.fileId)); renderSummary(); });
+  $('#selectAll').addEventListener('change', (event) => { pagedRecords().records.forEach((record) => event.target.checked ? state.selectedIds.add(record.fileId) : state.selectedIds.delete(record.fileId)); renderSummary(); });
+  $('#firstPage').addEventListener('click', () => goToPage(1));
+  $('#previousPage').addEventListener('click', () => goToPage(state.currentPage - 1));
+  $('#nextPage').addEventListener('click', () => goToPage(state.currentPage + 1));
+  $('#lastPage').addEventListener('click', () => goToPage(paginationFor().totalPages));
+  $('#pageSize').addEventListener('change', (event) => {
+    const firstVisibleIndex = (state.currentPage - 1) * state.pageSize;
+    state.pageSize = Number(event.target.value);
+    state.currentPage = Math.floor(firstVisibleIndex / state.pageSize) + 1;
+    table.viewport.scrollTop = 0;
+    renderSummary();
+  });
   $('#themeButton').addEventListener('click', () => applyTheme(state.settings.theme === 'light' ? 'dark' : 'light'));
   $('#outputFolderButton').addEventListener('click', chooseOutputFolder);
   $('#settingsButton').addEventListener('click', () => { $('#recursiveSetting').checked = state.settings.recursiveImport; $('#acoustIdKey').value = ''; $('#discogsToken').value = ''; $('#fpcalcPath').value = state.settings.fpcalcPath || ''; $('#settingsDialog').showModal(); });
-  $('#saveSettings').addEventListener('click', saveSettings); $('#saveButton').addEventListener('click', previewMetadata);
+  $('#saveSettings').addEventListener('click', saveSettings); $('#saveButton').addEventListener('click', () => previewSave());
   $('#artworkButton').addEventListener('click', () => state.selectedIds.size > 1 ? stageBatchArtwork() : stageArtwork()); $('#replaceArtwork').addEventListener('click', stageArtwork); $('#replaceArtworkLarge').addEventListener('click', stageArtwork); $('#removeArtwork').addEventListener('click', removeArtwork); $('#removeArtworkLarge').addEventListener('click', removeArtwork);
   $('#batchButton').addEventListener('click', () => { $('#batchPanel').open = true; $('#batchPanel').scrollIntoView({ block: 'nearest' }); });
   ['Artist', 'Album', 'Genre', 'Date'].forEach((name) => $(`#batch${name}Mode`).addEventListener('change', (event) => { const input = $(`#batch${name}Value`); input.disabled = event.target.value !== 'REPLACE'; input.placeholder = event.target.value === 'CLEAR' ? '(will clear field)' : ''; }));
   $('#batchArtworkReplace').addEventListener('click', stageBatchArtwork); $('#batchArtworkRemove').addEventListener('click', removeBatchArtwork);
-  $('#previewBatch').addEventListener('click', previewBatch); $('#confirmSave').addEventListener('click', confirmPreview);
+  $('#previewBatch').addEventListener('click', () => previewSave(true)); $('#confirmSave').addEventListener('click', confirmPreview);
   $('#cancelJob').addEventListener('click', async () => { if (state.currentJob) await guarded(async () => unwrap(await window.musicApp.jobs.cancel(state.currentJob.id))); });
   $('#matchButton').addEventListener('click', openMatchReview); $('#searchMatches').addEventListener('click', searchMatches); $('#fingerprintMatch').addEventListener('click', fingerprintMatch); $('#applyMatch').addEventListener('click', applyMatch); $('#applyReviewedMatches').addEventListener('click', applyReviewedMatches);
   $$('.match-sort').forEach((button) => button.addEventListener('click', () => {
@@ -739,7 +912,20 @@ async function initialize() {
   if (status) { state.settings = status.settings; state.outputFolder = status.outputFolder || ''; renderOutputFolder(); applyTheme(status.settings.theme, false); applyPanelRatio(status.settings.panelRatio); if (!status.worker.ready && status.worker.code) issue(status.worker.message, status.worker.code); else log(status.worker.message); }
   await reloadLibrary();
   window.musicApp.jobs.onProgress(updateJob);
-  window.musicApp.library.onRecordUpdated((record) => { replaceRecord(record, true, false); renderSummary(); if (state.activeId === record.fileId && getRecord(record.fileId)) fillEditor(record); });
+  window.musicApp.library.onRecordUpdated((update) => {
+    const record = update?.record || update;
+    if (!record?.fileId) return;
+    replaceRecord(record, update?.record ? update.clearDraft === true : true, false);
+    if (!recordMatchesStatusFilter(record, state.statusFilter, isDirty(record.fileId))) {
+      state.selectedIds.delete(record.fileId);
+      if (state.activeId === record.fileId) {
+        state.activeId = null;
+        $('#metadataForm').hidden = true; $('#editorEmpty').hidden = false; $('#technicalSummary').hidden = true;
+      }
+    }
+    renderSummary();
+    if (state.activeId === record.fileId && getRecord(record.fileId)) fillEditor(record);
+  });
   window.musicApp.library.onRefresh(reloadLibrary);
   window.musicApp.events.onWorkerStatus((workerStatus) => { if (workerStatus.ready) log(workerStatus.message); else issue(workerStatus.message, workerStatus.code || 'WORKER_UNAVAILABLE'); });
   window.musicApp.events.onWorkerEvent((event) => { if (event.event === 'scan-progress') { $('#jobTitle').textContent = 'Scanning library…'; $('#jobProgress').value = event.total ? event.processed / event.total * 100 : 0; $('#jobProgressText').textContent = `${event.processed} / ${event.total} tracks`; $('#jobCurrent').textContent = event.path; } });

@@ -7,24 +7,31 @@ const crypto = require('node:crypto');
 const { PythonBridge } = require('./workers/python-bridge');
 const { JobManager } = require('./jobs/job-manager');
 const { MusicBrainzService, candidatesFromAcoustId } = require('./services/musicbrainz.service');
-const { MetadataMatchService, normalizeCandidate, calculateMatchScore } = require('./services/metadata-match.service');
+const { MetadataMatchService, normalizeCandidate, calculateMatchScore, classifyMatchResult } = require('./services/metadata-match.service');
 const { validateTemplate } = require('./services/rename.service');
-const { OutputFolderSession, planOutputEntries, validateOutputFolder } = require('./services/output.service');
+const { buildBatchPatch, changesForPatch } = require('./services/batch-metadata.service');
+const { beginMatchStatus, reviewedStatus, savedStatus } = require('./services/record-workflow');
+const { OutputFolderSession, pathKey, planOutputEntries, validateOutputFolder } = require('./services/output.service');
 const { AUDIO_EXTENSIONS, MAX_ARTWORK_BYTES, AUTO_MATCH_CONCURRENCY } = require('../shared/constants');
-const { AppError, object, string, stringArray, fileIds, autoMatchFileIds, metadataPatch, batchOperations, publicError } = require('../shared/schemas');
+const { AppError, object, string, stringArray, fileIds, autoMatchFileIds, batchPreviewItems, metadataPatch, batchOperations, publicError } = require('../shared/schemas');
 
 const appRoot = path.resolve(__dirname, '..', '..');
 const library = new Map();
 const importedRoots = new Set();
 const stagedArtwork = new Map();
 const previews = new Map();
+const activeOutputPaths = new Set();
 const outputFolderSession = new OutputFolderSession();
 const jobs = new JobManager();
 const musicBrainz = new MusicBrainzService();
 const metadataMatcher = new MetadataMatchService({ musicBrainz, getSettings: readSettings });
+const shutdownController = new AbortController();
 let worker;
 let mainWindow;
 let workerStatus = { ready: false, message: 'Starting metadata worker…' };
+let shuttingDown = false;
+let shutdownComplete = false;
+let shutdownPromise = null;
 
 function settingsPath() { return path.join(app.getPath('userData'), 'settings.json'); }
 function defaults() { return { theme: 'light', recursiveImport: true, panelRatio: 0.65, acoustIdApiKey: '', discogsToken: '', fpcalcPath: '' }; }
@@ -82,6 +89,12 @@ function createWindow() {
     }
   });
   mainWindow.removeMenu();
+  mainWindow.on('close', (event) => {
+    if (shutdownComplete) return;
+    event.preventDefault();
+    mainWindow.hide();
+    requestShutdown();
+  });
   mainWindow.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   mainWindow.webContents.on('did-fail-load', (_event, code, description) => {
     console.error(`Renderer failed to load (${code}): ${description}`);
@@ -101,7 +114,8 @@ function createWindow() {
     if (process.env.MUSIC_METADATA_SMOKE === '1') {
       setTimeout(() => runLayoutSmokeTest().catch((error) => {
         console.error(`LAYOUT_SMOKE_ERROR ${error.stack || error.message}`);
-        app.exit(1);
+        process.exitCode = 1;
+        mainWindow.close();
       }), 500);
     }
   });
@@ -128,6 +142,7 @@ async function runLayoutSmokeTest() {
     search.dispatchEvent(new Event('input', { bubbles: true }));
     await new Promise((resolve) => setTimeout(resolve, 0));
     document.querySelector('.table-row')?.click();
+    document.querySelector('.table-row input[type="checkbox"]')?.click();
     document.getElementById('batchPanel').open = true;
     for (const id of ['savedCount', 'skippedCount', 'failedCount', 'jobConflictCount']) document.getElementById(id).textContent = '123456';
   })()`);
@@ -219,7 +234,7 @@ async function runLayoutSmokeTest() {
     viewport.scrollLeft = viewport.scrollWidth;
     await new Promise((resolve) => setTimeout(resolve, 0));
     const viewportBox = viewport.getBoundingClientRect();
-    const finalColumnBox = document.querySelector('.table-header .duration-cell').getBoundingClientRect();
+    const finalColumnBox = document.querySelector('.table-header .completed-cell').getBoundingClientRect();
     const headerBox = document.querySelector('.table-header').getBoundingClientRect();
     const rowBox = document.querySelector('.table-row').getBoundingClientRect();
     const horizontalGrid = {
@@ -323,6 +338,37 @@ async function runLayoutSmokeTest() {
     };
     matchDialog.close();
 
+    const { showPreview } = await import('./components/app.js');
+    showPreview({
+      previewId: 'layout-preview', conflicts: 0, warnings: [], affected: 50,
+      entries: Array.from({ length: 50 }, (_, index) => ({
+        fileId: 'preview-' + index,
+        path: '/synthetic/Long preview filename ' + String(index + 1).padStart(2, '0') + '.flac',
+        outputPath: '/output/Long preview filename ' + String(index + 1).padStart(2, '0') + '.flac',
+        writable: true, conflict: false,
+        changes: [
+          { field: 'title', before: 'Original title ' + index, after: 'Reviewed title ' + index },
+          { field: 'artist', before: ['Original artist'], after: ['Reviewed artist'] }
+        ]
+      }))
+    }, 'batch');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const previewDialog = document.getElementById('previewDialog');
+    const previewList = document.getElementById('changeList');
+    const previewBox = previewDialog.getBoundingClientRect();
+    const previewHeaderBox = previewDialog.querySelector('header').getBoundingClientRect();
+    const previewFooterBox = previewDialog.querySelector('.modal-actions').getBoundingClientRect();
+    previewList.scrollTop = previewList.scrollHeight;
+    const previewLayout = {
+      fitsViewport: previewBox.left >= 0 && previewBox.right <= innerWidth && previewBox.top >= 0 && previewBox.bottom <= innerHeight,
+      rendersFiftyFiles: previewList.querySelectorAll('.preview-file').length === 50,
+      listOwnsVerticalScroll: previewList.scrollHeight > previewList.clientHeight && getComputedStyle(previewList).overflowY === 'auto',
+      headerAccessible: previewHeaderBox.top >= previewBox.top && previewHeaderBox.bottom <= previewBox.bottom,
+      footerAccessible: previewFooterBox.top >= previewBox.top && previewFooterBox.bottom <= previewBox.bottom,
+      controlsNotClipped: previewFooterBox.left >= previewBox.left && previewFooterBox.right <= previewBox.right
+    };
+    previewDialog.close();
+
     document.getElementById('clearButton').click();
     await new Promise((resolve) => setTimeout(resolve, 0));
     const clear = {
@@ -334,7 +380,7 @@ async function runLayoutSmokeTest() {
       issuesReset: state.issues.length === 0 && document.getElementById('issueBadge').textContent === '(0)',
       themePreserved: root.dataset.theme === originalTheme
     };
-    return { switchedTheme, restoredTheme, horizontalGrid, matchReview, clear };
+    return { switchedTheme, restoredTheme, horizontalGrid, matchReview, previewLayout, clear };
   })()`);
   const virtualization = await mainWindow.webContents.executeJavaScript(`(async () => {
     const { state } = await import('./state/app-state.js');
@@ -356,18 +402,55 @@ async function runLayoutSmokeTest() {
     || !interactions.switchedTheme || !interactions.restoredTheme
     || Object.values(interactions.horizontalGrid).some((value) => !value)
     || Object.values(interactions.matchReview).some((value) => !value)
+    || Object.values(interactions.previewLayout).some((value) => !value)
     || Object.values(interactions.clear).some((value) => !value)
     || virtualization.total !== 1250 || virtualization.renderedRows >= 100;
   console.log(`LAYOUT_SMOKE ${JSON.stringify({ passed: !failed, results, interactions, virtualization })}`);
-  app.exit(failed ? 1 : 0);
+  process.exitCode = failed ? 1 : 0;
+  mainWindow.close();
 }
 
 function handle(channel, callback) {
   ipcMain.handle(channel, async (event, payload) => {
     if (!mainWindow || event.sender !== mainWindow.webContents) return { ok: false, error: { code: 'UNAUTHORIZED', message: 'Untrusted renderer.' } };
+    if (shuttingDown) return { ok: false, error: { code: 'APP_SHUTTING_DOWN', message: 'The application is shutting down.' } };
     try { return { ok: true, result: await callback(payload) }; }
     catch (error) { return { ok: false, error: publicError(error) }; }
   });
+}
+
+function cleanupTemporaryArtwork() {
+  for (const item of stagedArtwork.values()) {
+    if (!item.temporary) continue;
+    try { fs.unlinkSync(item.path); } catch (error) { if (error.code !== 'ENOENT') console.error(`Could not remove temporary artwork: ${error.message}`); }
+  }
+  stagedArtwork.clear();
+}
+
+async function performShutdown() {
+  shuttingDown = true;
+  shutdownController.abort();
+  jobs.cancelAll();
+  const workerStop = worker ? worker.stop({ gracefulTimeout: 3000, forceTimeout: 1500 }) : Promise.resolve();
+  const [, jobsResult] = await Promise.allSettled([workerStop, jobs.waitForIdle(5000)]);
+  if (jobsResult.status === 'fulfilled' && !jobsResult.value) console.error('Timed out waiting for active jobs to settle during shutdown.');
+  previews.clear();
+  cleanupTemporaryArtwork();
+  workerStatus = { ready: false, message: 'Metadata worker stopped.' };
+}
+
+function requestShutdown(exitCode = 0) {
+  if (exitCode) process.exitCode = exitCode;
+  if (shutdownComplete) { app.quit(); return Promise.resolve(); }
+  if (!shutdownPromise) {
+    shutdownPromise = performShutdown()
+      .catch((error) => console.error(`Shutdown cleanup failed: ${error.stack || error.message}`))
+      .finally(() => {
+        shutdownComplete = true;
+        setImmediate(() => app.quit());
+      });
+  }
+  return shutdownPromise;
 }
 
 function recordFor(id) {
@@ -381,6 +464,51 @@ function signature(record) { return { fileSize: record.fileSize, modifiedTimeNs:
 function publicRecord(record, includeArtwork = true) {
   if (includeArtwork) return record;
   return { ...record, artwork: (record.artwork || []).map(({ previewDataUrl, ...item }) => item) };
+}
+
+function recordStatusObject(record) {
+  if (record?.status && typeof record.status === 'object' && !Array.isArray(record.status)) return record.status;
+  return { processingStatus: typeof record?.status === 'string' ? record.status : 'ready' };
+}
+
+function publishRecord(record, clearDraft = false) {
+  library.set(record.fileId, record);
+  send('library:record-updated', { record: publicRecord(record, false), clearDraft });
+  return record;
+}
+
+function updateRecordStatus(fileId, patch, { clearDraft = false } = {}) {
+  const source = recordFor(fileId);
+  return publishRecord({ ...source, status: { ...recordStatusObject(source), ...patch } }, clearDraft);
+}
+
+function statusError(error, fallbackCode = 'INTERNAL_ERROR') {
+  return {
+    code: error?.code || fallbackCode,
+    message: error?.message || 'An unexpected error occurred.',
+    details: error?.details
+  };
+}
+
+function isConflictError(error) {
+  return ['FILE_CHANGED', 'OUTPUT_EXISTS', 'DUPLICATE_OUTPUT', 'OUTPUT_CONFLICT', 'RENAME_COLLISION'].includes(error?.code);
+}
+
+function resolveArtworkOperation(input) {
+  if (input?.mode === 'replace') {
+    const staged = stagedArtwork.get(input.token);
+    if (!staged) throw new AppError('ARTWORK_EXPIRED', 'Choose the artwork file again.');
+    return { mode: 'replace', path: staged.path };
+  }
+  return input?.mode === 'remove' ? { mode: 'remove' } : null;
+}
+
+async function withOutputLock(entry, action) {
+  const key = pathKey(entry.outputPath);
+  if (activeOutputPaths.has(key)) throw new AppError('OUTPUT_BUSY', 'Another save is already writing this Output file.');
+  activeOutputPaths.add(key);
+  try { return await action(); }
+  finally { activeOutputPaths.delete(key); }
 }
 
 function savePreview(type, entries, extra = {}) {
@@ -404,11 +532,9 @@ async function markSourceSaved(fileId, outputPath) {
   const record = {
     ...source,
     lastOutputPath: outputPath,
-    status: { ...(source.status || {}), saved: true, conflict: false, saveError: null }
+    status: savedStatus(source)
   };
-  library.set(fileId, record);
-  send('library:record-updated', record);
-  return record;
+  return publishRecord(record, true);
 }
 
 function registerIpc() {
@@ -468,89 +594,116 @@ function registerIpc() {
   handle('metadata:get', async (payload) => {
     const id = string(object(payload).fileId, 'fileId', { max: 128, allowEmpty: false });
     const record = recordFor(id);
-    const fresh = await worker.request('read_metadata', { path: record.absolutePath });
-    library.set(id, fresh);
-    return fresh;
+    try {
+      const fresh = await worker.request('read_metadata', { path: record.absolutePath });
+      const previousStatus = recordStatusObject(record);
+      const hasOtherError = Boolean(previousStatus.saveError || previousStatus.matchError || previousStatus.error || previousStatus.failed);
+      const merged = {
+        ...fresh,
+        status: {
+          ...(fresh.status || {}),
+          ...previousStatus,
+          processingStatus: previousStatus.processingStatus === 'error' && !hasOtherError ? 'ready' : previousStatus.processingStatus,
+          readError: null
+        }
+      };
+      library.set(id, merged);
+      return merged;
+    } catch (error) {
+      updateRecordStatus(id, { processingStatus: 'error', readError: statusError(error, 'READ_FAILED') });
+      throw error;
+    }
   });
   handle('metadata:preview', async (payload) => {
     const request = object(payload, 'preview request');
     const record = recordFor(string(request.fileId, 'fileId', { max: 128, allowEmpty: false }));
     const patch = metadataPatch(request.patch || {});
-    let artworkOperation = request.artworkOperation || null;
-    if (artworkOperation?.mode === 'replace') {
-      const staged = stagedArtwork.get(artworkOperation.token);
-      if (!staged) throw new AppError('ARTWORK_EXPIRED', 'Choose the artwork file again.');
-      artworkOperation = { mode: 'replace', path: staged.path };
-    } else if (artworkOperation?.mode === 'remove') artworkOperation = { mode: 'remove' };
-    else artworkOperation = null;
+    const artworkOperation = resolveArtworkOperation(request.artworkOperation);
     const result = await worker.request('preview_changes', { path: record.absolutePath, signature: signature(record), patch, artworkOperation });
     let entries = [{ fileId: record.fileId, path: record.absolutePath, signature: signature(record), patch, artworkOperation, changes: result.changes, conflict: result.conflict }];
     entries = planOutputEntries(entries, outputFolderSession.current, [...importedRoots]);
+    updateRecordStatus(record.fileId, {
+      conflict: Boolean(entries[0].conflict || entries[0].outputConflict),
+      conflictError: entries[0].outputConflict || (entries[0].conflict ? 'FILE_CHANGED' : null)
+    });
     return savePreview('metadata', entries, {
-      conflicts: entries[0].conflict ? 1 : 0,
+      conflicts: entries[0].conflict || entries[0].outputConflict ? 1 : 0,
       warnings: result.writable ? [] : [result.readOnlyReason],
       outputFolder: entries[0].outputFolder
     });
+  });
+  handle('metadata:mark-reviewed', async (payload) => {
+    const request = object(payload, 'review request');
+    const fileId = string(request.fileId, 'fileId', { max: 128, allowEmpty: false });
+    const source = recordFor(fileId);
+    return publishRecord({ ...source, status: reviewedStatus(source) }, false);
   });
   handle('metadata:save', async (payload) => {
     const preview = getPreview(object(payload).previewId, 'metadata');
     const entry = preview.entries[0];
     if (!entry.changes.length) return { unchanged: true };
-    if (entry.outputConflict) throw new AppError(entry.outputConflict, entry.outputConflict === 'OUTPUT_EXISTS' ? 'The Output file already exists.' : 'Multiple source files map to the same Output name.');
-    validateOutputFolder(entry.outputFolder, [entry.path], [...importedRoots]);
-    const result = await worker.request('save_metadata', entry, 120000);
     previews.delete(preview.previewId);
-    return {
-      sourceRecord: await markSourceSaved(entry.fileId, result.outputPath),
-      outputRecord: result.record,
-      outputPath: result.outputPath
-    };
+    try {
+      updateRecordStatus(entry.fileId, { processingStatus: 'saving', saved: false, done: false, outputVerified: false, saveError: null });
+      if (entry.outputConflict) throw new AppError(entry.outputConflict, entry.outputConflict === 'OUTPUT_EXISTS' ? 'The Output file already exists.' : 'Multiple source files map to the same Output name.');
+      validateOutputFolder(entry.outputFolder, [entry.path], [...importedRoots]);
+      const result = await withOutputLock(entry, () => worker.request('save_metadata', entry, 120000));
+      return {
+        sourceRecord: await markSourceSaved(entry.fileId, result.outputPath),
+        outputRecord: result.record,
+        outputPath: result.outputPath
+      };
+    } catch (error) {
+      updateRecordStatus(entry.fileId, {
+        processingStatus: 'error',
+        saved: false,
+        done: false,
+        outputVerified: false,
+        saveError: statusError(error, 'SAVE_FAILED'),
+        conflict: isConflictError(error) || recordStatusObject(recordFor(entry.fileId)).conflict
+      });
+      throw error;
+    }
   });
 
   handle('batch:preview', async (payload) => {
     const request = object(payload, 'batch preview');
-    const ids = fileIds(request.fileIds);
+    const snapshots = request.items
+      ? batchPreviewItems(request.items)
+      : batchPreviewItems(fileIds(request.fileIds).map((fileId) => ({ fileId, patch: {}, artworkOperation: null })));
     const operations = batchOperations(request.operations || {});
     const cleanup = request.cleanup === true;
     const find = typeof request.find === 'string' ? request.find : '';
     const replace = typeof request.replace === 'string' ? request.replace : '';
     const sequential = request.sequential === true;
-    let artworkOperation = null;
-    if (request.artworkOperation?.mode === 'replace') {
-      const staged = stagedArtwork.get(request.artworkOperation.token);
-      if (!staged) throw new AppError('ARTWORK_EXPIRED', 'Choose the batch artwork file again.');
-      artworkOperation = { mode: 'replace', path: staged.path };
-    } else if (request.artworkOperation?.mode === 'remove') artworkOperation = { mode: 'remove' };
+    const batchArtworkOperation = resolveArtworkOperation(request.artworkOperation);
     const entries = [];
     let index = Number(request.startTrack || 1);
-    for (const id of ids) {
-      const record = recordFor(id); const patch = {};
-      for (const [field, operation] of Object.entries(operations)) {
-        if (operation.operation === 'REPLACE') patch[field] = operation.value;
-        else if (operation.operation === 'CLEAR') patch[field] = Array.isArray(record.metadata[field]) ? [] : '';
-      }
-      if (cleanup || find) {
-        for (const field of ['title', 'album', 'date', 'comment']) {
-          if (Object.hasOwn(patch, field)) continue;
-          let value = String(record.metadata[field] || '');
-          if (cleanup) value = value.trim().replace(/\s+/g, ' ');
-          if (find) value = value.split(find).join(replace);
-          if (value !== record.metadata[field]) patch[field] = value;
-        }
-      }
-      if (sequential) patch.trackNumber = String(index++);
-      const changes = Object.entries(patch).filter(([field, value]) => JSON.stringify(record.metadata[field]) !== JSON.stringify(value)).map(([field, after]) => ({ field, before: record.metadata[field], after }));
+    for (const snapshot of snapshots) {
+      const record = recordFor(snapshot.fileId);
+      const patch = buildBatchPatch(record, snapshot.patch, operations, {
+        cleanup, find, replace, sequential, trackNumber: index
+      });
+      if (sequential) index += 1;
+      const changes = changesForPatch(record, patch);
+      const artworkOperation = batchArtworkOperation || resolveArtworkOperation(snapshot.artworkOperation);
       if (artworkOperation) changes.push({ field: 'artwork', before: `${record.artwork?.length || 0} embedded image(s)`, after: artworkOperation.mode });
       let conflict = false;
       try {
         const current = fs.statSync(record.absolutePath, { bigint: true });
         conflict = current.size !== BigInt(record.fileSize) || current.mtimeNs !== BigInt(record.modifiedTimeNs);
       } catch { conflict = true; }
-      entries.push({ fileId: id, path: record.absolutePath, signature: signature(record), patch, artworkOperation, changes, conflict, writable: record.capabilities?.writeTags !== false });
+      entries.push({ fileId: snapshot.fileId, path: record.absolutePath, signature: signature(record), patch, artworkOperation, changes, conflict, writable: record.capabilities?.writeTags !== false });
     }
     const planned = planOutputEntries(entries, outputFolderSession.current, [...importedRoots]);
+    for (const entry of planned) {
+      updateRecordStatus(entry.fileId, {
+        conflict: Boolean(entry.conflict || entry.outputConflict),
+        conflictError: entry.outputConflict || (entry.conflict ? 'FILE_CHANGED' : null)
+      });
+    }
     const readOnly = planned.filter((entry) => !entry.writable && entry.changes.length).length;
-    const conflicts = planned.filter((entry) => entry.conflict && entry.changes.length).length;
+    const conflicts = planned.filter((entry) => (entry.conflict || entry.outputConflict) && entry.changes.length).length;
     const warnings = [];
     if (readOnly) warnings.push(`${readOnly} read-only file(s) will fail.`);
     if (conflicts) warnings.push(`${conflicts} source or Output name conflict(s) will be reported without overwriting files.`);
@@ -560,15 +713,29 @@ function registerIpc() {
     });
   });
   handle('batch:save', async (payload) => {
+    if (jobs.hasActiveType('batch-save')) throw new AppError('BATCH_SAVE_IN_PROGRESS', 'A batch save is already running.');
     const preview = getPreview(object(payload).previewId, 'batch');
-    const actionable = preview.entries.filter((entry) => entry.changes.length);
-    const job = jobs.create('batch-save', actionable, async (entry) => {
-      if (entry.outputConflict) throw new AppError(entry.outputConflict, entry.outputConflict === 'OUTPUT_EXISTS' ? 'The Output file already exists.' : 'Multiple source files map to the same Output name.');
-      validateOutputFolder(entry.outputFolder, [entry.path], [...importedRoots]);
-      const result = await worker.request('save_metadata', entry, 120000);
-      await markSourceSaved(entry.fileId, result.outputPath);
-      return { status: 'saved', result: { outputPath: result.outputPath } };
-    });
+    const job = jobs.create('batch-save', preview.entries, async (entry) => {
+      if (!entry.changes.length) return { status: 'skipped', result: { fileId: entry.fileId, reason: 'NO_CHANGES' } };
+      try {
+        updateRecordStatus(entry.fileId, { processingStatus: 'saving', saved: false, done: false, outputVerified: false, saveError: null });
+        if (entry.outputConflict) throw new AppError(entry.outputConflict, entry.outputConflict === 'OUTPUT_EXISTS' ? 'The Output file already exists.' : 'Multiple source files map to the same Output name.');
+        validateOutputFolder(entry.outputFolder, [entry.path], [...importedRoots]);
+        const result = await withOutputLock(entry, () => worker.request('save_metadata', entry, 120000));
+        await markSourceSaved(entry.fileId, result.outputPath);
+        return { status: 'saved', result: { fileId: entry.fileId, outputPath: result.outputPath } };
+      } catch (error) {
+        updateRecordStatus(entry.fileId, {
+          processingStatus: 'error',
+          saved: false,
+          done: false,
+          outputVerified: false,
+          saveError: statusError(error, 'SAVE_FAILED'),
+          conflict: isConflictError(error) || recordStatusObject(recordFor(entry.fileId)).conflict
+        });
+        throw error;
+      }
+    }, { inProgressStatus: 'saving' });
     previews.delete(preview.previewId);
     return job;
   });
@@ -586,7 +753,10 @@ function registerIpc() {
     const url = string(object(payload).url, 'url', { max: 500, allowEmpty: false });
     const parsed = new URL(url);
     if (parsed.protocol !== 'https:' || parsed.hostname !== 'coverartarchive.org') throw new AppError('INVALID_URL', 'Only Cover Art Archive suggestions can be staged.');
-    const response = await fetch(url, { redirect: 'follow', signal: AbortSignal.timeout(20000), headers: { 'User-Agent': musicBrainz.userAgent } });
+    const response = await fetch(url, {
+      redirect: 'follow', signal: AbortSignal.any([shutdownController.signal, AbortSignal.timeout(20000)]),
+      headers: { 'User-Agent': musicBrainz.userAgent }
+    });
     if (!response.ok) throw new AppError('NETWORK_ERROR', `Artwork download failed (HTTP ${response.status}).`);
     const bytes = Buffer.from(await response.arrayBuffer());
     if (bytes.length > MAX_ARTWORK_BYTES) throw new AppError('ARTWORK_TOO_LARGE', 'Artwork must be 15 MB or smaller.');
@@ -622,7 +792,7 @@ function registerIpc() {
 
   handle('match:search', async (payload) => {
     const request = object(payload); const record = recordFor(string(request.fileId, 'fileId', { max: 128, allowEmpty: false }));
-    const result = await metadataMatcher.searchTrack(record);
+    const result = await metadataMatcher.searchTrack(record, { signal: shutdownController.signal });
     return { ...result, coverArtBase: 'https://coverartarchive.org', noMatch: result.candidates.length === 0 };
   });
   handle('match:batch-start', async (payload) => {
@@ -631,12 +801,26 @@ function registerIpc() {
     const records = ids.map(recordFor);
     const providers = metadataMatcher.providerStatuses();
     return jobs.create('metadata-match', records, async (record, _job, context) => {
-      const result = await metadataMatcher.searchTrack(record, context);
-      const allProvidersFailed = result.providerCount > 0 && result.providerErrors.length === result.providerCount;
-      const status = result.candidates.length ? 'matched' : allProvidersFailed ? 'failed' : 'noMatch';
-      return { status, result: { ...result, status: status === 'noMatch' ? 'no-match' : status } };
+      publishRecord({ ...recordFor(record.fileId), status: beginMatchStatus(recordFor(record.fileId)) }, false);
+      try {
+        const result = await metadataMatcher.searchTrack(recordFor(record.fileId), context);
+        const { jobStatus, matchStatus, matchError } = classifyMatchResult(result);
+        updateRecordStatus(record.fileId, {
+          processingStatus: matchStatus,
+          matchStatus,
+          matchError
+        });
+        return { status: jobStatus, result: { ...result, status: matchStatus } };
+      } catch (error) {
+        const cancelled = context.signal?.aborted || error?.name === 'AbortError' || error?.code === 'ABORT_ERR';
+        updateRecordStatus(record.fileId, cancelled
+          ? { processingStatus: 'cancelled', matchStatus: 'cancelled', matchError: null }
+          : { processingStatus: 'error', matchStatus: 'failed', matchError: statusError(error, 'MATCH_FAILED') });
+        throw error;
+      }
     }, {
       concurrency: AUTO_MATCH_CONCURRENCY,
+      inProgressStatus: 'searching',
       publicData: { providers }
     });
   });
@@ -662,6 +846,9 @@ function registerIpc() {
       normalized.matchScore = calculateMatchScore(record, normalized, { fingerprintConfidence: candidate.score / 100 });
       return normalized;
     });
+    if (candidates.length) {
+      updateRecordStatus(record.fileId, { processingStatus: 'matched', matchStatus: 'matched', matchError: null });
+    }
     return { ...matches, candidates, fingerprintGenerated: true, noMatch: candidates.length === 0 };
   });
   handle('match:cover-url', async (payload) => ({ url: musicBrainz.coverArtUrl(string(object(payload).releaseId, 'releaseId', { max: 64 })) }));
@@ -690,8 +877,15 @@ app.whenReady().then(async () => {
     workerStatus = { ready: false, message: error.message, code: error.code };
   }
   send('worker:status', workerStatus);
-  app.on('activate', () => { if (BrowserWindow.getAllWindows().length === 0) createWindow(); });
+  app.on('activate', () => { if (!shuttingDown && BrowserWindow.getAllWindows().length === 0) createWindow(); });
 });
 
-app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });
-app.on('before-quit', () => { if (worker) worker.stop(); });
+app.on('window-all-closed', () => { if (!shutdownComplete) requestShutdown(); });
+app.on('before-quit', (event) => {
+  if (shutdownComplete) return;
+  event.preventDefault();
+  requestShutdown();
+});
+app.on('will-quit', () => { jobs.cancelAll(); });
+process.once('SIGINT', () => requestShutdown(130));
+process.once('SIGTERM', () => requestShutdown(143));

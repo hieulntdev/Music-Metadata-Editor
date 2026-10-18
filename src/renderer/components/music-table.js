@@ -1,9 +1,22 @@
-import { filteredRecords, metadataFor, state } from '../state/app-state.js';
+import { filteredRecords, isDirty, metadataFor, pagedRecords, state } from '../state/app-state.js';
+import { recordStatus } from '../state/record-status.mjs';
+import { filenameFor } from '../state/sort-records.mjs';
 
 const COLUMN_WIDTHS_KEY = 'music-metadata-editor.column-widths.v1';
-const COLUMN_MIN_WIDTHS = { title: 96, artist: 88, album: 96, year: 58, genre: 72, track: 61, duration: 65 };
-const COLUMN_DEFAULT_WIDTHS = { title: 144, artist: 108, album: 151, year: 58, genre: 86, track: 61, duration: 65 };
+export const COLUMN_DEFINITIONS = Object.freeze([
+  { key: 'filename', className: 'filename-cell', minWidth: 120, defaultWidth: 180, alignment: 'left', resizable: true },
+  { key: 'title', className: 'title-cell', minWidth: 96, defaultWidth: 144, alignment: 'left', resizable: true },
+  { key: 'artist', className: 'artist-cell', minWidth: 88, defaultWidth: 108, alignment: 'left', resizable: true },
+  { key: 'album', className: 'album-cell', minWidth: 96, defaultWidth: 151, alignment: 'left', resizable: true },
+  { key: 'year', className: 'year-cell', minWidth: 58, defaultWidth: 58, alignment: 'center', resizable: true },
+  { key: 'genre', className: 'genre-cell', minWidth: 72, defaultWidth: 86, alignment: 'center', resizable: true },
+  { key: 'track', className: 'track-cell', minWidth: 61, defaultWidth: 61, alignment: 'center', resizable: true },
+  { key: 'duration', className: 'duration-cell', minWidth: 65, defaultWidth: 65, alignment: 'center', resizable: true },
+  { key: 'completed', className: 'completed-cell', minWidth: 72, defaultWidth: 82, alignment: 'center', resizable: true }
+]);
+const COLUMN_BY_KEY = new Map(COLUMN_DEFINITIONS.map((column) => [column.key, column]));
 const SELECT_COLUMN_WIDTH = 40;
+const ID_COLUMN_WIDTH = 52;
 const MAX_COLUMN_WIDTH = 1200;
 
 function duration(seconds) {
@@ -31,9 +44,9 @@ export class MusicTable {
     try {
       const saved = JSON.parse(localStorage.getItem(COLUMN_WIDTHS_KEY) || '{}');
       return Object.fromEntries(Object.entries(saved).filter(([column, width]) => (
-        Object.hasOwn(COLUMN_MIN_WIDTHS, column)
+        COLUMN_BY_KEY.get(column)?.resizable
         && Number.isFinite(width)
-        && width >= COLUMN_MIN_WIDTHS[column]
+        && width >= COLUMN_BY_KEY.get(column).minWidth
         && width <= MAX_COLUMN_WIDTH
       )));
     } catch {
@@ -49,8 +62,8 @@ export class MusicTable {
   }
 
   updateContentWidth() {
-    const width = Object.entries(COLUMN_DEFAULT_WIDTHS)
-      .reduce((total, [column, defaultWidth]) => total + (this.columnWidths[column] || defaultWidth), SELECT_COLUMN_WIDTH);
+    const width = COLUMN_DEFINITIONS
+      .reduce((total, column) => total + (this.columnWidths[column.key] || column.defaultWidth), SELECT_COLUMN_WIDTH + ID_COLUMN_WIDTH);
     this.viewport.style.setProperty('--table-content-width', `${width}px`);
   }
 
@@ -61,6 +74,8 @@ export class MusicTable {
   setupColumnResizing() {
     for (const handle of this.viewport.querySelectorAll('.column-resizer')) {
       const column = handle.dataset.column;
+      const definition = COLUMN_BY_KEY.get(column);
+      if (!definition?.resizable) continue;
       const header = handle.parentElement;
       let drag = null;
       const finish = () => {
@@ -81,7 +96,7 @@ export class MusicTable {
       });
       handle.addEventListener('pointermove', (event) => {
         if (!drag || event.pointerId !== drag.pointerId) return;
-        const width = Math.min(MAX_COLUMN_WIDTH, Math.max(COLUMN_MIN_WIDTHS[column], Math.round(drag.startWidth + event.clientX - drag.startX)));
+        const width = Math.min(MAX_COLUMN_WIDTH, Math.max(definition.minWidth, Math.round(drag.startWidth + event.clientX - drag.startX)));
         this.columnWidths[column] = width;
         this.viewport.style.setProperty(`--column-${column}`, `${width}px`);
         this.updateContentWidth();
@@ -98,7 +113,9 @@ export class MusicTable {
   }
 
   render() {
-    this.records = filteredRecords();
+    const derived = pagedRecords(filteredRecords());
+    this.records = derived.records;
+    this.recordOffset = derived.page.startIndex;
     const rowHeight = this.rowHeight();
     this.body.style.height = this.records.length ? `${this.records.length * rowHeight}px` : '';
     this.renderRows();
@@ -141,24 +158,35 @@ export class MusicTable {
       else this.toggle(record.fileId, checkbox.checked);
     });
     selectCell.append(checkbox); row.append(selectCell);
-    const values = [
-      ['title-cell', metadata.title || '(Untitled)'], ['artist-cell', (metadata.artist || []).join('; ') || '—'],
-      ['album-cell', metadata.album || '—'], ['year-cell', metadata.date || '—'], ['genre-cell', (metadata.genre || []).join('; ') || '—'],
-      ['track-cell', metadata.trackNumber ? `${metadata.trackNumber}${metadata.trackTotal ? `/${metadata.trackTotal}` : ''}` : '—'],
-      ['duration-cell', duration(record.durationSeconds)]
-    ];
-    for (const [className, value] of values) {
-      const cell = document.createElement('div'); cell.className = `cell ${className}`; cell.role = 'cell'; cell.textContent = value; cell.title = value; row.append(cell);
-    }
-    row.addEventListener('click', (event) => {
-      if (event.shiftKey && this.selectionAnchorId) this.selectRange(record.fileId, true, !(event.metaKey || event.ctrlKey));
-      else if (event.metaKey || event.ctrlKey) this.toggle(record.fileId, !state.selectedIds.has(record.fileId));
-      else {
-        state.activeId = record.fileId;
-        if (!state.selectedIds.has(record.fileId)) { state.selectedIds.clear(); state.selectedIds.add(record.fileId); this.onSelection(); }
-        this.selectionAnchorId = record.fileId;
-        this.onActivate(record.fileId);
+    const idCell = document.createElement('div'); idCell.className = 'cell id-cell'; idCell.role = 'cell'; idCell.textContent = String(this.recordOffset + index + 1); row.append(idCell);
+    const values = {
+      filename: filenameFor(record) || '—', title: metadata.title || '(Untitled)', artist: (metadata.artist || []).join('; ') || '—',
+      album: metadata.album || '—', year: metadata.date || '—', genre: (metadata.genre || []).join('; ') || '—',
+      track: metadata.trackNumber ? `${metadata.trackNumber}${metadata.trackTotal ? `/${metadata.trackTotal}` : ''}` : '—',
+      duration: duration(record.durationSeconds)
+    };
+    for (const definition of COLUMN_DEFINITIONS) {
+      const cell = document.createElement('div');
+      cell.className = `cell ${definition.className} align-${definition.alignment}`; cell.role = 'cell';
+      if (definition.key === 'completed') {
+        const done = recordStatus(record, isDirty(record.fileId)).done;
+        const indicator = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        indicator.setAttribute('viewBox', '0 0 24 24'); indicator.setAttribute('aria-hidden', 'true');
+        indicator.setAttribute('class', `completed-indicator${done ? ' done' : ''}`);
+        indicator.innerHTML = done
+          ? '<circle cx="12" cy="12" r="9"></circle><path d="m8 12 2.5 2.5L16 9"></path>'
+          : '<circle cx="12" cy="12" r="9"></circle><path d="M9 12h6"></path>';
+        cell.setAttribute('aria-label', done ? 'Completed' : 'Not completed');
+        cell.title = done ? `Completed${record.lastOutputPath ? ` — ${record.lastOutputPath}` : ''}` : 'Not completed';
+        cell.append(indicator);
+      } else {
+        const value = values[definition.key]; cell.textContent = value; cell.title = value;
       }
+      row.append(cell);
+    }
+    row.addEventListener('click', () => {
+      state.activeId = record.fileId;
+      this.onActivate(record.fileId);
       this.renderRows();
     });
     row.addEventListener('dblclick', () => this.onActivate(record.fileId));
@@ -168,9 +196,7 @@ export class MusicTable {
   toggle(fileId, selected) {
     if (selected) state.selectedIds.add(fileId); else state.selectedIds.delete(fileId);
     this.selectionAnchorId = fileId;
-    if (selected) state.activeId = fileId;
     this.onSelection(); this.renderRows();
-    if (selected) this.onActivate(fileId);
   }
 
   selectRange(fileId, selected, replace = false) {
@@ -183,7 +209,8 @@ export class MusicTable {
       if (selected) state.selectedIds.add(this.records[index].fileId);
       else state.selectedIds.delete(this.records[index].fileId);
     }
-    state.activeId = fileId;
-    this.onSelection(); this.renderRows(); this.onActivate(fileId);
+    this.onSelection(); this.renderRows();
   }
+
+  resetSelectionAnchor() { this.selectionAnchorId = null; }
 }
