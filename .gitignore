@@ -93,3 +93,6 @@ coverage/
 *.old
 *.orig
 *.copy
+
+# Local tests
+/tests/
